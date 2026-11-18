@@ -1,0 +1,50 @@
+import SwiftUI
+
+@main struct ReadFastApp: App {
+    @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
+
+    var body: some Scene {
+        Window("Welcome to ReadFast", id: "launcher") {
+            LauncherView()
+        }
+        .defaultSize(width: 760, height: 520)
+        .defaultLaunchBehavior(.presented)
+        .restorationBehavior(.disabled)
+
+        DocumentGroup(viewing: CSVDocument.self) { file in
+            CSVDocumentView(url: file.fileURL)
+        }
+        .commands { ZoomCommands() }
+
+        Settings {
+            SettingsView()
+        }
+        .defaultSize(width: 680, height: 460)
+        .windowResizability(.contentMinSize)
+    }
+}
+
+struct ZoomCommands: Commands {
+    @AppStorage("zoom") private var zoom = 1.0
+
+    var body: some Commands {
+        CommandGroup(after: .toolbar) {
+            Button("Actual Size") { zoom = 1 }
+                .keyboardShortcut("0")
+            Button("Zoom In") { zoom = min(zoom + 0.1, 3) }
+                .keyboardShortcut("+")
+            Button("Zoom Out") { zoom = max(zoom - 0.1, 0.6) }
+                .keyboardShortcut("-")
+        }
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    // The launcher replaces the open panel a viewer-only DocumentGroup shows at launch.
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { false }
+
+    /// The tab bar's "+" button (and ⌘T) lands here via the responder chain: pick a file to open as a new tab.
+    @IBAction func newWindowForTab(_ sender: Any?) {
+        NSDocumentController.shared.openDocument(sender)
+    }
+}
