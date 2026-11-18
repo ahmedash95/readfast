@@ -78,6 +78,22 @@ struct DetectionTests {
         #expect(try open("1;2\n3;4\n", hasHeader: true).delimiter == UInt8(ascii: ";"))
     }
 
+    /// A quote opens a field only right after the delimiter, so the delimiter
+    /// (sniffed or forced) decides where rows end.
+    @Test func forcedDelimiterDecidesWhereQuotesOpen() throws {
+        let text = "a;\"x;y\nz\";b\n1;2;3\n"
+        let sniffed = try open(text)
+        #expect(sniffed.delimiter == UInt8(ascii: ";"))
+        #expect(sniffed.rowCount == .exact(2))
+        #expect(sniffed.row(0) == ["a", "x;y\nz", "b"])
+        let forced = try open(text, delimiter: UInt8(ascii: ","))
+        #expect(forced.rowCount == .exact(3)) // the quote is mid-field: plain, the newline ends the row
+        #expect(forced.row(0) == ["a;\"x;y"])
+        #expect(forced.row(1) == ["z\";b"])
+        // same with a tab: the quote after ';' isn't at a field start either
+        #expect(try open(text, delimiter: UInt8(ascii: "\t")).rowCount == .exact(3))
+    }
+
     @Test func randomInputNeverCrashesAndReturnsACandidate() throws {
         var rng = SplitMix(state: 42)
         for _ in 0..<300 {

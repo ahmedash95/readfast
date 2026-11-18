@@ -81,7 +81,7 @@ private struct Searcher {
     let fold: Bool
     let piece: [UInt8]
     let verify: Bool
-    var state = rf_search_state(inside: false, rows: 0, row_start: 0, cell_start: 0, last_hit_cell: -1)
+    var state = rf_search_state(state: UInt8(RF_FIELD), rows: 0, row_start: 0, cell_start: 0, last_hit_cell: -1)
     var total = 0
     // column cursor: the last cell seen and its column
     var rowStart = -1, cellStart = 0, column = 0
@@ -97,27 +97,38 @@ private struct Searcher {
 
     mutating func scan(_ from: Int, _ to: Int, threads: Int) -> [SearchMatch] {
         var hits: UnsafeMutablePointer<rf_hit>?
-        let n = rf_search(bytes(file.data), file.data.count, from, to, piece, piece.count, fold, file.delimiter, threads, &state, &hits)
+        let n = rf_search(bytes(file.data), file.data.count, from, to, piece, piece.count, fold, file.delimiter, file.newline,
+                          threads, &state, &hits)
         defer { free(hits) }
         var out: [SearchMatch] = []
         for h in UnsafeBufferPointer(start: hits, count: n) {
             let col = columnOf(cell: Int(h.cell), rowStart: Int(h.row_start))
-            if verify, !cellMatches(Int(h.cell)) { continue }
+            if verify || h.check, !cellMatches(Int(h.cell)) { continue }
             out.append(SearchMatch(row: Int(h.row), column: col))
         }
         total += out.count
         return out
     }
 
+    /// readfast.h's quote rule, one byte at a time from a cell start (RF_FIELD).
+    /// Whether `c` ends the cell: a delimiter or newline outside a quoted field.
+    private func ends(_ state: inout UInt8, _ c: UInt8) -> Bool {
+        if state == RF_QUOTED {
+            if c == Fields.quote { state = UInt8(RF_FIELD) } // closed; a quote next is ""
+            return false
+        }
+        if c == file.delimiter || c == file.newline { state = UInt8(RF_FIELD); return true }
+        state = UInt8(c == Fields.quote && state == RF_FIELD ? RF_QUOTED : RF_UNQUOTED)
+        return false
+    }
+
     /// Walks forward from the last cell seen in the same row (hits come in
     /// file order), so a row is walked once however many cells match.
     private mutating func columnOf(cell: Int, rowStart rs: Int) -> Int {
         if rs != rowStart { rowStart = rs; cellStart = rs; column = 0 }
-        let d = file.data, delim = file.delimiter
-        var inside = false // cell starts are outside quotes
-        for i in cellStart..<cell {
-            if d[i] == Fields.quote { inside.toggle() } else if d[i] == delim, !inside { column += 1 }
-        }
+        let d = file.data
+        var state = UInt8(RF_FIELD) // cellStart is a cell start
+        for i in cellStart..<cell where ends(&state, d[i]) { column += 1 }
         cellStart = cell
         return column
     }
@@ -125,13 +136,9 @@ private struct Searcher {
     /// Whether the cell's displayed text contains the query.
     private func cellMatches(_ cell: Int) -> Bool {
         let d = file.data
-        var end = cell, inside = false
-        while end < d.count {
-            let c = d[end]
-            if c == Fields.quote { inside.toggle() } else if !inside, c == file.delimiter || c == UInt8(ascii: "\n") { break }
-            end += 1
-        }
-        let rowEnd = end == d.count || d[end] == UInt8(ascii: "\n")
+        var end = cell, state = UInt8(RF_FIELD)
+        while end < d.count, !ends(&state, d[end]) { end += 1 }
+        let rowEnd = end == d.count || d[end] == file.newline
         if rowEnd, end > cell, d[end - 1] == UInt8(ascii: "\r") { end -= 1 } // as rowRange trims it
         let text = Fields.split(UnsafeRawBufferPointer(rebasing: d[cell..<end]), delimiter: file.delimiter, encoding: file.encoding)[0]
         let shown = fold ? text.utf8.map(lowerASCII) : Array(text.utf8)

@@ -1,15 +1,12 @@
 #include "rf_search.h"
-#include "readfast.h"
+#include "scan.h"
 #include <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
 
 // Bit i set <=> (b[i] | o) == c. With o = 0x20 and a lowercase letter c this
 // matches both cases and nothing else. Reads exactly 64 bytes. Same trick as
-// rf_eq_mask, inlined here because the scan calls it 5 times per block.
+// rf_eq_mask, inlined here because the scan calls it per block.
 static inline uint64_t eq_or(const uint8_t *b, uint8_t c, uint8_t o) {
 #if defined(__ARM_NEON)
     const uint8x16_t w = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
@@ -28,33 +25,30 @@ static inline uint64_t eq_or(const uint8_t *b, uint8_t c, uint8_t o) {
 #endif
 }
 
-static inline uint64_t prefix_xor(uint64_t x) {
-    x ^= x << 1; x ^= x << 2; x ^= x << 4; x ^= x << 8; x ^= x << 16; x ^= x << 32;
-    return x;
-}
-
 static inline uint8_t lower(uint8_t c) { return c >= 'A' && c <= 'Z' ? c | 0x20 : c; }
 static inline uint8_t fold_mask(uint8_t c) { return c >= 'a' && c <= 'z' ? 0x20 : 0; }
 static inline int64_t last_bit(size_t i, uint64_t m) { return (int64_t)(i + 63 - (size_t)__builtin_clzll(m)); }
 
 typedef struct {
     rf_hit *hits;
-    size_t count, cap, quotes;
-    bool inside, ends_inside;
+    size_t count, cap;
+    uint8_t state, end_state; // quote-rule state at the chunk's start / end
     uint64_t newlines;
     int64_t last_nl, last_bound; // -1: none in this chunk
 } chunk_t;
 
 typedef struct {
     const uint8_t *p, *needle; // needle lowercased when folding
-    size_t n, from, to, blocks, threads, len;
+    size_t n, from, to, bs, blocks, threads, len;
     bool fold;
-    uint8_t delim, f, fo, l, lo; // first/last needle byte and their OR masks
+    rf_syntax s;
+    uint8_t f, fo, l, lo; // first/last needle byte and their OR masks
     chunk_t *chunks;
 } search_ctx;
 
+// Chunks are runs of whole blocks of `bs` bytes, split like rf_index's.
 static size_t chunk_start(const search_ctx *c, size_t k) {
-    size_t s = c->from + c->blocks * k / c->threads * 64;
+    size_t s = c->from + c->blocks * k / c->threads * c->bs;
     return s < c->to ? s : c->to;
 }
 
@@ -77,6 +71,16 @@ static inline uint64_t candidates(const search_ctx *c, size_t i) {
     return m;
 }
 
+// Whether the closing quote at j is followed by text that `Fields` appends to
+// the cell (`"ab"cd` shows `abcd`): then the cell can show the needle without
+// holding its bytes in a row. Normal files never have it.
+static bool text_after_close(const search_ctx *c, size_t j) {
+    if (j + 1 >= c->n) return false;
+    uint8_t x = c->p[j + 1];
+    if (x == '"' || x == c->s.delim || x == c->s.nl) return false;
+    return !(x == '\r' && (j + 2 >= c->n || c->p[j + 2] == c->s.nl)); // a trimmed row-ending '\r'
+}
+
 static void push(chunk_t *ch, rf_hit h) {
     if (ch->count == ch->cap) {
         ch->cap = ch->cap ? ch->cap * 2 : 64;
@@ -85,40 +89,40 @@ static void push(chunk_t *ch, rf_hit h) {
     ch->hits[ch->count++] = h;
 }
 
-static void count_quotes(void *ctx, size_t k) {
-    search_ctx *c = ctx;
-    size_t s = chunk_start(c, k);
-    c->chunks[k].quotes = rf_count_byte(c->p + s, chunk_start(c, k + 1) - s, '"');
-}
-
 // Hits hold chunk-local values: row = newlines before it in this chunk;
 // cell / row_start = -1 when they begin before the chunk. rf_search fixes them up.
 static void scan(void *ctx, size_t k) {
     search_ctx *c = ctx;
     chunk_t *ch = &c->chunks[k];
     size_t e = chunk_start(c, k + 1);
-    uint64_t carry = ch->inside ? ~0ULL : 0, newlines = 0;
+    rf_carry carry = rf_to_carry(ch->state);
+    uint64_t newlines = 0;
     int64_t last_nl = -1, last_bound = -1, last_cell = INT64_MIN;
     for (size_t i = chunk_start(c, k); i < e; i += 64) {
         size_t len = e - i < 64 ? e - i : 64;
         const uint8_t *b = c->p + i;
-        uint8_t pad[64] = {0}; // zeros are neither '"', '\n' nor a delimiter
+        uint8_t pad[64] = {0}; // zeros are neither '"', a newline nor a delimiter
         if (len < 64) { memcpy(pad, b, len); b = pad; }
-        uint64_t inside = prefix_xor(eq_or(b, '"', 0)) ^ carry;
-        carry = 0 - (inside >> 63);
-        uint64_t nl = eq_or(b, '\n', 0) & ~inside;
-        uint64_t bound = nl | (eq_or(b, c->delim, 0) & ~inside);
+        uint64_t inside, close;
+        uint64_t nl = rf_block(b, c->s, &carry, (int)len - 1, RF_U8, &inside, &close);
+        uint64_t bound = nl | (eq_or(b, c->s.delim, 0) & ~inside);
         uint64_t cand = candidates(c, i) & (len < 64 ? (1ULL << len) - 1 : ~0ULL);
-        while (cand) {
-            size_t j = (size_t)__builtin_ctzll(cand);
-            cand &= cand - 1;
-            if (!verify(c, i + j)) continue;
+        uint64_t odd = 0; // closing quotes followed by text
+        for (uint64_t m = close; m; m &= m - 1)
+            if (text_after_close(c, i + (size_t)__builtin_ctzll(m))) odd |= m & (0 - m);
+        for (uint64_t all = cand | odd; all; all &= all - 1) {
+            size_t j = (size_t)__builtin_ctzll(all);
+            bool check = false;
+            if (!(cand >> j & 1) || !verify(c, i + j)) {
+                if (!(odd >> j & 1)) continue;
+                check = true;
+            }
             uint64_t below = (1ULL << j) - 1, bb = bound & below, nb = nl & below;
             int64_t cell = bb ? last_bit(i, bb) + 1 : last_bound >= 0 ? last_bound + 1 : -1;
             if (cell == last_cell) continue; // one hit per cell
             last_cell = cell;
             int64_t rs = nb ? last_bit(i, nb) + 1 : last_nl >= 0 ? last_nl + 1 : -1;
-            push(ch, (rf_hit){cell, rs, newlines + (uint64_t)__builtin_popcountll(nb)});
+            push(ch, (rf_hit){cell, rs, newlines + (uint64_t)__builtin_popcountll(nb), check});
         }
         newlines += (uint64_t)__builtin_popcountll(nl);
         if (nl) last_nl = last_bit(i, nl);
@@ -127,11 +131,11 @@ static void scan(void *ctx, size_t k) {
     ch->newlines = newlines;
     ch->last_nl = last_nl;
     ch->last_bound = last_bound;
-    ch->ends_inside = carry != 0;
+    ch->end_state = rf_from_carry(carry);
 }
 
 size_t rf_search(const uint8_t *p, size_t n, size_t from, size_t to, const uint8_t *needle, size_t len,
-                 bool fold, uint8_t delim, size_t threads, rf_search_state *st, rf_hit **out) {
+                 bool fold, uint8_t delim, uint8_t nl, size_t threads, rf_search_state *st, rf_hit **out) {
     *out = NULL;
     if (from >= to || len == 0) return 0;
     uint8_t *lowered = NULL;
@@ -141,18 +145,25 @@ size_t rf_search(const uint8_t *p, size_t n, size_t from, size_t to, const uint8
         needle = lowered;
     }
     search_ctx c = {.p = p, .needle = needle, .n = n, .from = from, .to = to, .len = len, .fold = fold,
-                    .delim = delim, .f = needle[0], .l = needle[len - 1]};
+                    .s = {delim, nl}, .f = needle[0], .l = needle[len - 1]};
     if (fold) { c.fo = fold_mask(c.f); c.lo = fold_mask(c.l); }
-    c.blocks = (to - from + 63) / 64;
-    c.threads = threads < 1 ? 1 : threads > c.blocks ? c.blocks : threads;
+    // ~16 blocks per thread: fine-grained enough for rf_index's repair pass
+    size_t t = threads < 1 ? 1 : threads, units = (to - from + 63) / 64;
+    c.bs = 64 * ((units + 16 * t - 1) / (16 * t));
+    c.blocks = (to - from + c.bs - 1) / c.bs;
+    c.threads = t > c.blocks ? c.blocks : t;
     c.chunks = calloc(c.threads, sizeof(chunk_t));
 
-    // Same two passes as rf_index: quote parity gives each chunk its start state.
-    if (c.threads > 1) dispatch_apply_f(c.threads, DISPATCH_APPLY_AUTO, &c, count_quotes);
-    bool inside = st->inside;
-    for (size_t k = 0; k < c.threads; k++) {
-        c.chunks[k].inside = inside;
-        inside ^= c.chunks[k].quotes & 1;
+    // Pass 1: each chunk's start state from rf_index's speculative parallel
+    // scan (the quote rule needs the state, not just quote parity). Pass 2: hits.
+    c.chunks[0].state = st->state;
+    if (c.threads > 1) {
+        uint32_t *counts = malloc(c.blocks * sizeof(uint32_t));
+        uint8_t *states = malloc(c.blocks);
+        rf_index(p + from, to - from, c.bs, c.threads, delim, nl, st->state, counts, states);
+        for (size_t k = 1; k < c.threads; k++) c.chunks[k].state = states[c.blocks * k / c.threads];
+        free(counts);
+        free(states);
     }
     dispatch_apply_f(c.threads, DISPATCH_APPLY_AUTO, &c, scan);
 
@@ -167,14 +178,14 @@ size_t rf_search(const uint8_t *p, size_t n, size_t from, size_t to, const uint8
             int64_t cell = x.cell >= 0 ? x.cell : st->cell_start;
             if (cell == st->last_hit_cell) continue; // a cell spanning chunks
             st->last_hit_cell = cell;
-            res[m++] = (rf_hit){cell, x.row_start >= 0 ? x.row_start : st->row_start, st->rows + x.row};
+            res[m++] = (rf_hit){cell, x.row_start >= 0 ? x.row_start : st->row_start, st->rows + x.row, x.check};
         }
         st->rows += ch->newlines;
         if (ch->last_nl >= 0) st->row_start = ch->last_nl + 1;
         if (ch->last_bound >= 0) st->cell_start = ch->last_bound + 1;
         free(ch->hits);
     }
-    st->inside = c.chunks[c.threads - 1].ends_inside;
+    st->state = c.chunks[c.threads - 1].end_state;
     free(c.chunks);
     free(lowered);
     *out = res;

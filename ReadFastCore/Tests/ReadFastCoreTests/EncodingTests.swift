@@ -170,4 +170,68 @@ struct EncodingTests {
             #expect(f.row(5001) == nil)
         }
     }
+
+    /// RowIndexTests.strayQuoteAtEveryOffset in UTF-16: one stray quote at every
+    /// offset (on and around block, chunk and segment boundaries) gives the same
+    /// rows as UTF-8, and UTF-8 gives the oracle's. U+220A / U+2C22 have a '"' / ','
+    /// byte, so a byte-level slip shows up.
+    @Test(arguments: [1, 2, 3, 8])
+    func strayQuoteAtEveryOffsetUTF16(threads: Int) {
+        let clean = Array(String(repeating: "123,\u{e9}\u{220A}\u{2C22},\"q,x\"\n", count: 30))
+        for at in 0...clean.count {
+            var chars = clean
+            chars.insert("\"", at: at)
+            let text = String(chars)
+            let d = Array(text.utf8)
+            let want = Oracle.rowRanges(d).map { r in Array(d[r]).withUnsafeBytes { Fields.split($0, delimiter: 44) } }
+            #expect(indexedRows(d, .utf8, threads) == want, "quote at \(at)")
+            for be in [false, true] {
+                #expect(indexedRows(utf16(text, bigEndian: be), be ? .utf16BE : .utf16LE, threads) == want, "quote at \(at), BE \(be)")
+            }
+        }
+    }
+
+    /// A delimiter then a quote, slid across every unit offset of quote-free
+    /// blocks: the state carried out of a block with no quotes (field start vs
+    /// unquoted) decides whether the next block's quote opens a field.
+    @Test(arguments: [1, 3])
+    func quoteAfterDelimiterAtEveryBlockOffset(threads: Int) {
+        for pad in 0..<200 {
+            let text = String(repeating: "x", count: pad) + ",\"a\nb\",c\n" + String(repeating: "y", count: 130) + "\"\n,\"d\ne\"\n"
+            let d = Array(text.utf8)
+            let want = Oracle.rowRanges(d).map { r in Array(d[r]).withUnsafeBytes { Fields.split($0, delimiter: 44) } }
+            #expect(want.count == 3)
+            #expect(indexedRows(d, .utf8, threads) == want, "pad \(pad)")
+            for be in [false, true] {
+                #expect(indexedRows(utf16(text, bigEndian: be), be ? .utf16BE : .utf16LE, threads) == want, "pad \(pad), BE \(be)")
+            }
+        }
+    }
+
+    /// Rows through a segmented parallel RowIndex: 128-byte blocks, 3-block segments.
+    private func indexedRows(_ d: [UInt8], _ enc: CSVEncoding, _ threads: Int) -> [[String]] {
+        withBuffer(d) { buf in
+            let idx = RowIndex.build(buf, upTo: d.count, blockSize: 128, threads: threads, encoding: enc, segmentBytes: 384)
+            return (0..<idx.rowCount(buf).value).map { r in
+                Fields.split(UnsafeRawBufferPointer(rebasing: buf[idx.rowRange(r, buf)!]), delimiter: 44, encoding: enc)
+            }
+        }
+    }
+
+    /// Classic Mac line endings ('\r' only) in UTF-16, bigger than the preview.
+    @Test(arguments: [false, true])
+    func classicMacUTF16(bigEndian: Bool) async throws {
+        var text = "id;note\r"
+        for i in 1...1500 { text += i % 3 == 0 ? "\(i);\"two\rlines\n\u{e9}\"\r" : "\(i);x\u{20AC}\r" }
+        try await withFile(utf16(text, bigEndian: bigEndian, bom: true)) { url in
+            let f = try CSVFile(url: url, previewBytes: 2048, blockSize: 256)
+            #expect(f.encoding == (bigEndian ? .utf16BE : .utf16LE))
+            #expect(f.newline == UInt8(ascii: "\r"))
+            #expect(f.delimiter == UInt8(ascii: ";"))
+            #expect(f.row(0) == ["id", "note"])
+            await f.indexAll(threads: 3, segmentBytes: 1024)
+            #expect(f.rowCount == .exact(1501))
+            for i in 1...1500 { #expect(f.row(i) == ["\(i)", i % 3 == 0 ? "two\rlines\n\u{e9}" : "x\u{20AC}"], "row \(i)") }
+        }
+    }
 }

@@ -6,12 +6,13 @@ import Testing
 /// Find in file: cells whose displayed text contains the query, vs a scalar oracle.
 struct SearchTests {
     /// Split every row with the oracle + Fields and keep the cells containing the query.
-    static func oracle(_ d: [UInt8], _ query: String, delimiter: UInt8, caseSensitive: Bool) -> [SearchMatch] {
+    static func oracle(_ d: [UInt8], _ query: String, delimiter: UInt8, newline: UInt8 = UInt8(ascii: "\n"),
+                       caseSensitive: Bool) -> [SearchMatch] {
         guard !query.isEmpty else { return [] }
         func fold(_ s: String) -> [UInt8] { s.utf8.map { caseSensitive ? $0 : (65...90).contains($0) ? $0 + 32 : $0 } }
         let q = fold(query)
         var out: [SearchMatch] = []
-        for (r, range) in Oracle.rowRanges(d).enumerated() {
+        for (r, range) in Oracle.rowRanges(d, delimiter: delimiter, newline: newline).enumerated() {
             let fields = Array(d[range]).withUnsafeBytes { Fields.split($0, delimiter: delimiter) }
             for (c, f) in fields.enumerated() {
                 let h = fold(f)
@@ -39,10 +40,16 @@ struct SearchTests {
         var rng = SplitMix(state: UInt64(threads * 1000 + segmentBytes))
         let alphabet = Array("aAbB,;\n\"\r")
         for trial in 0..<60 {
-            let d = randomBytes(Int.random(in: 0..<1500, using: &rng), &rng, alphabet: "aAbB,;;\n\n\"\"\r ")
+            // stray quotes everywhere; every 5th file has '\r' but no '\n' (classic Mac),
+            // every 4th forces ';' (where a quote opens depends on the delimiter)
+            let d = randomBytes(Int.random(in: 0..<1500, using: &rng), &rng,
+                                alphabet: trial % 5 == 4 ? "aAbB,;;\r\r\"\" " : "aAbB,;;\n\n\"\"\r ")
             let url = try tempFile(d)
             defer { try? FileManager.default.removeItem(at: url) }
-            let f = try CSVFile(url: url, previewBytes: 1024, blockSize: 1024)
+            let f = try CSVFile(url: url, previewBytes: 1024, blockSize: 1024,
+                                delimiter: trial % 4 == 3 ? UInt8(ascii: ";") : nil)
+            if trial % 5 == 4, d.contains(UInt8(ascii: "\r")) { #expect(f.newline == UInt8(ascii: "\r")) }
+            await f.indexAll(threads: 2)
             for k in 0..<8 {
                 let len = Int.random(in: 1...8, using: &rng)
                 let q: String
@@ -54,8 +61,13 @@ struct SearchTests {
                 }
                 let cs = Bool.random(using: &rng)
                 let got = await Self.run(f, q, caseSensitive: cs, threads: threads, segmentBytes: segmentBytes)
-                let want = Self.oracle(d, q, delimiter: f.delimiter, caseSensitive: cs)
+                let want = Self.oracle(d, q, delimiter: f.delimiter, newline: f.newline, caseSensitive: cs)
                 #expect(got.matches == want, "trial \(trial) query \(q.debugDescription) cs \(cs)")
+                for m in got.matches { // the cell row(_:) shows holds the query
+                    let cell = f.row(m.row).flatMap { m.column < $0.count ? $0[m.column] : nil }
+                    func fold(_ s: String) -> [UInt8] { s.utf8.map { cs ? $0 : (65...90).contains($0) ? $0 + 32 : $0 } }
+                    #expect(cell.map { fold($0).firstRange(of: fold(q)) != nil } == true)
+                }
                 #expect(got.steps.last?.total == want.count)
                 #expect(got.steps.last?.isComplete == true)
             }
@@ -100,6 +112,26 @@ struct SearchTests {
         #expect(await Self.run(f, "h, j").matches == [SearchMatch(row: 0, column: 2)])
         #expect(await Self.run(f, "a,").matches.isEmpty) // the delimiter isn't text
         #expect(await Self.run(f, "J\r").matches.isEmpty) // the trailing \r is trimmed
+    }
+
+    /// Search uses the index's quote rule: a stray quote doesn't hide the rows
+    /// after it, and text after a closing quote is part of the shown cell.
+    @Test func strayQuotesAndTextAfterClosingQuote() async throws {
+        let (f, url) = try Self.file("id,size,note\n12,5\" pipe,ok\n13,\"ab\"cd,x\n14,y,pipe\n")
+        defer { try? FileManager.default.removeItem(at: url) }
+        #expect(await Self.run(f, "pipe").matches == [SearchMatch(row: 1, column: 1), SearchMatch(row: 3, column: 2)])
+        #expect(await Self.run(f, "5\" p").matches == [SearchMatch(row: 1, column: 1)])
+        #expect(await Self.run(f, "bc").matches == [SearchMatch(row: 2, column: 1)]) // shown as abcd
+        #expect(await Self.run(f, "b\"c").matches.isEmpty)
+        #expect(f.row(2) == ["13", "abcd", "x"])
+    }
+
+    @Test func classicMacFile() async throws {
+        let (f, url) = try Self.file("a,b\r1,\"x\ry\"\r2,y\r")
+        defer { try? FileManager.default.removeItem(at: url) }
+        #expect(f.newline == UInt8(ascii: "\r"))
+        #expect(await Self.run(f, "y").matches == [SearchMatch(row: 1, column: 1), SearchMatch(row: 2, column: 1)])
+        #expect(await Self.run(f, "x\ry").matches == [SearchMatch(row: 1, column: 1)])
     }
 
     @Test func noMatchesAndEmptyQuery() async throws {

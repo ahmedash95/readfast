@@ -1,5 +1,8 @@
+import CReadFast
+
 /// Delimiter and header sniffing over a handful of preview rows. Scalar: it
-/// runs once per `open`, on at most `sampleRows` rows of `sampleRowBytes` each.
+/// runs once per `open`, on at most `sampleRows` rows (the delimiter from the
+/// first `sampleBytes`, the header from rows cut at `sampleRowBytes`).
 ///
 /// Not candidates: ':' (times like 12:30:00 split every row the same way) and
 /// ' ' (prose splits into a consistent-looking word count). Both would win
@@ -7,6 +10,8 @@
 extension Fields {
     static let sampleRows = 50
     static let sampleRowBytes = 64 << 10
+    /// How much of the file's head the delimiter sniffer reads.
+    static let sampleBytes = 64 << 10
     static let delimiterCandidates: [UInt8] = [UInt8(ascii: ","), UInt8(ascii: ";"), UInt8(ascii: "\t"), UInt8(ascii: "|")]
 
     /// The candidate whose field count is the same on the most rows (that count
@@ -14,30 +19,27 @@ extension Fields {
     /// A title line, ragged rows and quoted delimiters don't sway it. A comma
     /// that only ever sits between digits (`1,5;2,7`) is a decimal comma: ';'
     /// wins any tie with it. Nothing fits (one column, empty): ','.
-    static func sniffDelimiter(_ rows: [UnsafeRawBufferPointer], encoding: CSVEncoding = .utf8) -> UInt8 {
-        encoding.unitWidth == 2 ? sniffDelimiter(units: rows.map(encoding.units)) : sniffDelimiter(units: rows)
-    }
-
-    /// Over code units, so UTF-16 rows are read as 16-bit units (a CJK unit's
-    /// bytes can look like ',' or ';').
-    private static func sniffDelimiter<C: RandomAccessCollection>(units rows: [C]) -> UInt8
-    where C.Element: FixedWidthInteger, C.Index == Int {
+    ///
+    /// `texts` are raw: it runs before the index, which needs the delimiter.
+    /// Each candidate splits them into rows (at '\n', '\r\n' or '\r' outside
+    /// quoted fields, up to `sampleRows`) and fields with its own quote rule
+    /// (readfast.h), since where a quote opens depends on the delimiter.
+    /// A text's last row without a newline counts only if it's the only row or
+    /// `complete` (the text is the whole file, not a cut-off head).
+    /// UTF-16 text is read as 16-bit units (a CJK unit's bytes can look like ',' or ';').
+    static func sniffDelimiter(_ texts: [UnsafeRawBufferPointer], encoding: CSVEncoding = .utf8, complete: Bool = true) -> UInt8 {
         let cands = delimiterCandidates
         var counts = [[Int: Int]](repeating: [:], count: cands.count) // fields per row -> rows
         var decimalCommas = true
-        for row in rows {
-            var n = [Int](repeating: 1, count: cands.count)
-            var inside = false
-            for i in row.indices {
-                let unit = row[i]
-                if unit == quote { inside.toggle(); continue }
-                if inside || unit >= 0x80 { continue }
-                let c = UInt8(unit)
-                guard let k = cands.firstIndex(of: c) else { continue }
-                n[k] += 1
-                if k == 0, !(i > row.startIndex && i + 1 < row.endIndex && isDigit(row[i - 1]) && isDigit(row[i + 1])) { decimalCommas = false }
+        var fields = [UInt32](repeating: 0, count: sampleRows)
+        for (k, d) in cands.enumerated() {
+            for text in texts where !text.isEmpty {
+                var tail: UInt32 = 0, betweenDigits = true
+                let rows = rf_sniff_rows(bytes(text), text.count, d, sampleRows, &fields, &tail, &betweenDigits, encoding.scanUnit)
+                for f in fields[..<rows] { counts[k][Int(f), default: 0] += 1 }
+                if tail > 0, rows == 0 || complete { counts[k][Int(tail), default: 0] += 1 } // last row, no newline
+                if k == 0, !betweenDigits { decimalCommas = false }
             }
-            for k in cands.indices { counts[k][n[k], default: 0] += 1 }
         }
         // per candidate: (rows sharing the most common count, that count); ties -> more fields
         let stats = counts.map { $0.max { ($0.value, $0.key) < ($1.value, $1.key) }.map { (rows: $0.value, fields: $0.key) } }

@@ -78,22 +78,24 @@ searchTask.cancel()                          // new query: the scan stops within
 
 | Thing | Rule |
 |---|---|
-| What matches | Cells whose **displayed** text (what `row(_:)` returns) contains the query: inside quoted fields too, `""` matches a `"` in the query, but the delimiter, outer quotes, row-ending newline and trailing `\r` are not text. A match never spans two cells or rows. One match per cell. |
+| What matches | Cells whose **displayed** text (what `row(_:)` returns) contains the query: inside quoted fields too, `""` matches a `"` in the query, but the delimiter, outer quotes, row-ending newline and trailing `\r` are not text. Stray quotes and text after a closing quote (`"ab"cd` matches `bc`) follow the same quote rule as `row(_:)`. A match never spans two cells or rows. One match per cell. |
 | Case | `caseSensitive: false` folds ASCII letters only; `é` doesn't match `É`. Other bytes compare exactly. |
 | Order | Matches arrive in file order (row, then column), steps front to back. |
 | Indexing | Independent of `indexAll`: the search counts rows itself (same quote rules), so it works right after `open`. A match can be in a row `row(_:)` can't serve yet (`row >= availableRows`); it fills in when indexing gets there. |
 | Empty query | One complete step with no matches. |
-| Speed | ~10 GB/s warm when matches are rare; ~2.5 GB/s when every row matches (columns are counted serially per match). |
+| Speed | ~9 GB/s warm when matches are rare; ~2 GB/s when every row matches (columns are counted serially per match). |
 
 ### Semantics to get right
 
 | Thing | Rule |
 |---|---|
 | Row numbering | Row 0 is always the first line of the file, whatever `hasHeader` says. Let `h = hasHeader ? 1 : 0`: header is `hasHeader ? row(0) : nil` (show `Column 1…` names otherwise), data row `i` is `row(i + h)`, data row count is `max(0, rowCount.value - h)`. |
-| Delimiter | Detected once in `open` from up to 50 preview rows: among `, ; \t \|`, the one whose field count (> 1, quotes respected) is the same on the most rows, then the one with more fields. A title/comment line or ragged rows don't sway it; `1,5;2,7` (decimal commas) picks `;`. No fit (one column, empty file) → `,`. `:` and space are never detected (times and prose fool them); force them if needed. |
+| Delimiter | Detected once in `open`, **before** indexing (where a quote opens depends on it), from up to 50 rows of the first 64 KB: among `, ; \t \|`, the one whose field count (> 1, each candidate splitting with its own quote rule) is the same on the most rows, then the one with more fields. A title/comment line or ragged rows don't sway it; `1,5;2,7` (decimal commas) picks `;`. No fit (one column, empty file) → `,`. `:` and space are never detected (times and prose fool them); force them if needed. |
 | Header | Detected once in `open` from the same rows: a text cell over a numeric/date column votes header; a number/date over one votes no; a top cell repeated in its text column votes no; duplicate names or 2+ empty names vote no. Ties (e.g. all-text tables) → header. A single row is a header if its cells are distinct non-empty text. Empty file → `false`. |
-| Overrides | `open(url, delimiter: UInt8(ascii: ";"), hasHeader: false)` uses the values as given (any byte except `"`/newlines works as delimiter). Pass nil (default) to detect. To change them from the toolbar, re-`open` the URL (it's ~10 ms) and restart `indexAll`. Forcing only the delimiter still detects the header with that delimiter. |
+| Overrides | `open(url, delimiter: UInt8(ascii: ";"), hasHeader: false)` uses the values as given (any byte except `"`/newlines works as delimiter). Pass nil (default) to detect. To change them from the toolbar, re-`open` the URL (it's ~10 ms) and restart `indexAll`. Forcing only the delimiter still detects the header with that delimiter. A forced delimiter also decides where quotes open, so it can change where rows end. |
 | Fields | Already split and unquoted: `"Smith, J"` → `Smith, J`, `""` → `"`. Quoted newlines stay inside the field. Trailing `\r` is stripped. A BOM is skipped. Invalid UTF-8 becomes `�`. |
+| Quotes | RFC 4180, lenient. A `"` opens a quoted field only as the field's **first character** (start of row or right after the delimiter). Inside, `""` is a literal `"` and a single `"` closes the field; any text after the closing quote up to the next delimiter is kept as is (`"ab"cd` → `abcd`). A `"` anywhere else is an ordinary character: `12,5" pipe,ok` → `12`, `5" pipe`, `ok`, and the rows after it are unaffected. A quote that opens at a field start and never closes still runs to the end of the file (shown cut at `maxRowBytes`, raw, with its quote). `, "x"` (space first) is not quoted. Same rule in every encoding, in the index, `row(_:)` and search. |
+| Line endings | `\n` and `\r\n` (mixed is fine). Files whose first `previewBytes` contain `\r` but no row-ending `\n` are read as classic Mac files: `\r` ends rows, `\n` is an ordinary character (any encoding). |
 | Encoding | Detected from the first `previewBytes`: UTF-8 / UTF-16 LE / UTF-16 BE BOM, then BOM-less UTF-16 (zero bytes on one side of most units), then valid UTF-8, else Windows-1252. Offer a menu that reopens with `open(url, encoding:)`: a file that is ASCII in the sample but 1252 later is read as UTF-8 (`�`), and BOM-less UTF-16 with no Latin text (e.g. all CJK) isn't detected. UTF-16 is scanned in place as 16-bit units (same NEON masks, 64 units per mask), never transcoded. |
 | Ragged rows | Rows can have more or fewer fields than the header. Pad/ignore in the UI; never index blindly. |
 | `row(i) == nil` | Either `i >= rowCount` or the index hasn't reached row `i` yet. Check `i < availableRows` to tell them apart; show a placeholder row while indexing. |
@@ -215,19 +217,34 @@ from other sources (launcher recents, drag and drop).
 
 ```sh
 cd ReadFastCore
-swift test                                   # all tests, ~5 s
+swift test                                   # all tests, ~8 s
 RF_BENCH=1 swift test -c release --filter benchmark   # open / index / search GB/s on a 1 GB file
 ```
 
 Tests use tiny block and segment sizes, so 2 KB inputs exercise the same paths as
 a 10 GB file: SIMD primitives vs scalar, quotes split across threads and
 segments, preview → progressive → exact index, a 4 GB sparse file opening in
-< 200 ms without being read, and runaway (unclosed-quote) rows.
+< 200 ms without being read, runaway (unclosed-quote) rows, stray quotes at
+every offset around block/chunk/segment boundaries (UTF-8 and UTF-16), CR-only
+and mixed CRLF files. Index and search are fuzzed against `Oracle`
+(Tests/…/Support.swift), the quote rule written as a plain byte-by-byte state
+machine; UTF-16 and Windows-1252 must give the same rows as UTF-8.
+
+How the scan applies the quote rule in parallel: per 64 units (bytes, or
+16-bit units for UTF-16, same masks) it assumes every quote toggles (prefix
+XOR), then drops quote runs that start after an ordinary unit outside quotes
+(rare: one extra round per stray quote). The state between units is one of
+field start / unquoted / quoted (`RF_*` in `readfast.h`), so each thread
+guesses its chunk's start state from the unit before it, and a serial pass
+rescans blocks only where the guess was wrong, until it converges. Search
+gets its chunks' start states the same way (a state-only pass first), then
+scans for matches with the same kernel (`scan.h`).
 
 ## Layout (for changing the engine, not for using it)
 
 ```
-Sources/CReadFast/        C + NEON: 64-byte masks, prefix-XOR quote tracking, parallel block index;
+Sources/CReadFast/        C + NEON: 64-unit masks, speculative parallel block index (readfast.c);
+                          scan.h: the quote-rule block kernel shared by index and search;
                           search.c: parallel substring scan, one hit per cell
 Sources/ReadFastCore/
   CSVFile.swift           public API: mmap, preview, progressive indexAll
@@ -241,4 +258,6 @@ Sources/ReadFastCore/
 Known limits: Intel Macs / x86 simulators use a slower scalar path; a file
 truncated by another process while open crashes on read (SIGBUS). Search
 matches raw bytes, so it also finds cells past the 1 MB `maxRowBytes` cut, and
-a query containing `�` doesn't match invalid UTF-8 shown as `�`.
+a query containing `�` doesn't match invalid UTF-8 shown as `�`. After an
+unclosed quote, the rest of the file is indexed (and searched) at one-core
+speed (the parallel guesses are all wrong); it's still one row.
