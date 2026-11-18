@@ -9,7 +9,17 @@ import ReadFastCore
 /// grows from an estimate to the exact count and `progress` goes 0 → 1.
 @MainActor @Observable
 final class CSVTable {
+    /// Column names: the header row, or "Column 1…" without one (and for columns wider than it).
     let header: [String]
+    let url: URL
+    /// What the user forced for this file (nil fields = detect).
+    let options: CSVOptions
+    /// What the engine detected for each setting, for "Automatic (…)" in the menu. For a forced
+    /// setting it's carried over from the previous open, since the engine didn't detect it this time.
+    let detected: CSVOptions
+    var encoding: CSVEncoding { file.encoding }
+    var delimiter: UInt8 { file.delimiter }
+    var hasHeader: Bool { file.hasHeader }
     /// File size in bytes.
     let byteCount: Int
     /// Data rows (header excluded). Estimated until `isExact`.
@@ -22,8 +32,8 @@ final class CSVTable {
 
     // MARK: Find
 
-    /// Matches kept for highlighting and stepping, in file order (raw file rows: data row + 1, header
-    /// matches dropped). ponytail: capped so "every row matches" can't eat memory; `searchTotal`
+    /// Matches kept for highlighting and stepping, in file order (raw file rows: data row + 1 with a
+    /// header, whose matches are dropped). ponytail: capped so "every row matches" can't eat memory; `searchTotal`
     /// still counts them all.
     static let maxStoredMatches = 1_000_000
     @ObservationIgnored private(set) var matches: [SearchMatch] = []
@@ -36,19 +46,35 @@ final class CSVTable {
     private(set) var searchVersion = 0
     var supportsSearch: Bool { file.supportsSearch }
 
-    static func load(_ url: URL) async throws -> CSVTable {
-        CSVTable(file: try await open(url))
+    /// Overrides chosen in the Format menu, per file, for this session (not persisted).
+    static var sessionOptions: [URL: CSVOptions] = [:]
+
+    /// Opens `url` with `options` (default: this session's overrides for it). `previous` is the
+    /// table being replaced, whose detected values stand in for the settings now forced.
+    static func load(_ url: URL, options: CSVOptions? = nil, previous: CSVTable? = nil) async throws -> CSVTable {
+        let options = options ?? sessionOptions[url] ?? CSVOptions()
+        sessionOptions[url] = options
+        let file = try await open(url, options: options)
+        return CSVTable(file: file, url: url, options: options, previousDetected: previous?.detected)
     }
 
-    @concurrent nonisolated private static func open(_ url: URL) async throws -> CSVFile {
+    @concurrent nonisolated private static func open(_ url: URL, options: CSVOptions) async throws -> CSVFile {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        return try CSVFile.open(url) // the mapping stays valid after access stops
+        // The mapping stays valid after access stops.
+        return try CSVFile.open(url, encoding: options.encoding, delimiter: options.delimiter, hasHeader: options.hasHeader)
     }
 
-    private init(file: CSVFile) {
+    private init(file: CSVFile, url: URL, options: CSVOptions, previousDetected: CSVOptions?) {
         self.file = file
-        header = file.row(0) ?? []
+        self.url = url
+        self.options = options
+        detected = CSVOptions(encoding: options.encoding == nil ? file.encoding : previousDetected?.encoding,
+                              delimiter: options.delimiter == nil ? file.delimiter : previousDetected?.delimiter,
+                              hasHeader: options.hasHeader == nil ? file.hasHeader : previousDetected?.hasHeader)
+        let previewRows = (0..<min(file.availableRows, Self.previewRows)).compactMap { file.row($0) }
+        header = Self.columnNames(header: file.hasHeader ? previewRows.first : nil,
+                                  width: previewRows.map(\.count).max() ?? 0)
         byteCount = file.byteCount
         refresh()
         #if DEBUG
@@ -67,7 +93,19 @@ final class CSVTable {
     /// Fields of data row `row` (0-based, header excluded). Empty while that row isn't indexed
     /// yet; a real row always has at least one field.
     func fields(at row: Int) -> [String] {
-        file.row(row + 1) ?? []
+        file.row(row + headerRows) ?? []
+    }
+
+    /// File rows before the first data row: 1 with a header, else 0.
+    private var headerRows: Int { file.hasHeader ? 1 : 0 }
+
+    /// Rows sampled for the column count, so header-less or ragged files show every column.
+    static let previewRows = 100
+
+    /// `header` padded with "Column N" up to `width` (all generated when there's no header).
+    nonisolated static func columnNames(header: [String]?, width: Int) -> [String] {
+        let header = header ?? []
+        return header + (header.count..<max(width, header.count)).map { "Column \($0 + 1)" }
     }
 
     /// Replace the matches with those of `query`, accumulating as the scan streams. Cancel the
@@ -83,7 +121,7 @@ final class CSVTable {
         for await step in file.search(query) {
             if Task.isCancelled { return }
             for match in step.matches {
-                if match.row == 0 { headerMatches += 1 }
+                if match.row < headerRows { headerMatches += 1 }
                 else if matches.count < Self.maxStoredMatches { matches.append(match) }
             }
             searchTotal = step.total - headerMatches
@@ -97,16 +135,17 @@ final class CSVTable {
         guard let i = Self.step(currentMatch, by: delta, count: matches.count) else { return nil }
         currentMatch = i
         searchVersion += 1
-        return (matches[i].row - 1, matches[i].column)
+        return (matches[i].row - headerRows, matches[i].column)
     }
 
     /// Columns of data row `row` that match, and which of them is the current match.
     func matchedColumns(inRow row: Int) -> (columns: [Int], current: Int?) {
         guard !matches.isEmpty else { return ([], nil) }
-        var i = Self.firstIndex(atOrAfter: row + 1, in: matches.lazy.map(\.row))
+        let fileRow = row + headerRows
+        var i = Self.firstIndex(atOrAfter: fileRow, in: matches.lazy.map(\.row))
         var columns: [Int] = []
         var current: Int?
-        while i < matches.count, matches[i].row == row + 1 {
+        while i < matches.count, matches[i].row == fileRow {
             columns.append(matches[i].column)
             if i == currentMatch { current = matches[i].column }
             i += 1
@@ -140,12 +179,49 @@ final class CSVTable {
         assert(step(nil, by: 1, count: 3) == 0 && step(nil, by: -1, count: 3) == 2)
         assert(step(2, by: 1, count: 3) == 0 && step(0, by: -1, count: 3) == 2)
         assert(step(nil, by: 1, count: 0) == nil)
+        assert(columnNames(header: ["a", "b"], width: 1) == ["a", "b"])
+        assert(columnNames(header: ["a"], width: 3) == ["a", "Column 2", "Column 3"])
+        assert(columnNames(header: nil, width: 2) == ["Column 1", "Column 2"])
+        assert(columnNames(header: nil, width: 0).isEmpty)
+        assert(delimiterName(UInt8(ascii: "\t")) == "Tab" && delimiterName(UInt8(ascii: ":")) == "“:”")
     }()
     #endif
 
     private func refresh() {
-        rowCount = max(0, file.rowCount.value - 1)
+        rowCount = max(0, file.rowCount.value - headerRows)
         isExact = file.isIndexed
         progress = file.indexedFraction
+    }
+}
+
+/// Format overrides for one file; nil = let the engine detect it.
+struct CSVOptions: Hashable {
+    var encoding: CSVEncoding?
+    var delimiter: UInt8?
+    var hasHeader: Bool?
+}
+
+extension CSVTable {
+    static let delimiters: [UInt8] = [UInt8(ascii: ","), UInt8(ascii: ";"), UInt8(ascii: "\t"), UInt8(ascii: "|")]
+
+    nonisolated static func delimiterName(_ byte: UInt8) -> String {
+        switch byte {
+        case UInt8(ascii: ","): "Comma"
+        case UInt8(ascii: ";"): "Semicolon"
+        case UInt8(ascii: "\t"): "Tab"
+        case UInt8(ascii: "|"): "Pipe"
+        default: "“\(Character(Unicode.Scalar(byte)))”"
+        }
+    }
+}
+
+extension CSVEncoding {
+    var name: String {
+        switch self {
+        case .utf8: "UTF-8"
+        case .utf16LE: "UTF-16 LE"
+        case .utf16BE: "UTF-16 BE"
+        case .windows1252: "Windows-1252"
+        }
     }
 }

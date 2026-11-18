@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import ReadFastCore
 
 /// Read-only. Doesn't touch the file contents: the view hands `fileURL` to the engine, which maps it.
 nonisolated struct CSVDocument: FileDocument {
@@ -37,6 +38,7 @@ struct CSVDocumentView: View {
                 CSVGrid(table: table, rowCount: table.rowCount, isExact: table.isExact,
                         fontSize: NSFont.systemFontSize * zoom, showRowNumbers: showRowNumbers,
                         stripes: renderStripes, opaque: renderOpaque, jump: jump, searchVersion: table.searchVersion)
+                    .id(ObjectIdentifier(table))   // columns are built in makeNSView: a reopen makes a new grid
             } else {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -49,6 +51,9 @@ struct CSVDocumentView: View {
         .toolbar {
             ToolbarItem(placement: .principal) { statusPill }
             ToolbarItem(placement: .primaryAction) {
+                if let table { FormatMenu(table: table, reopen: reopen) }
+            }
+            ToolbarItem(placement: .primaryAction) {
                 FindField(text: $query, enabled: table?.supportsSearch ?? false, focus: focusFind, submit: stepMatch)
                     .frame(width: 180)
             }
@@ -57,7 +62,7 @@ struct CSVDocumentView: View {
         .background(TabBarShower())
         .focusedSceneValue(\.showGoToRow, table == nil ? nil : $showGoToRow)
         .focusedSceneValue(\.find, table?.supportsSearch == true ? FindActions(focus: { focusFind += 1 }, step: stepMatch) : nil)
-        .task(id: query) {
+        .task(id: SearchKey(query: query, table: table.map(ObjectIdentifier.init))) {   // re-runs on reopen
             guard let table else { return }
             if !query.isEmpty {
                 do { try await Task.sleep(for: .milliseconds(150)) } catch { return }   // debounce typing
@@ -80,6 +85,21 @@ struct CSVDocumentView: View {
                 let loaded = try await CSVTable.load(url) // header + preview rows: instant
                 table = loaded
                 await loaded.index()                      // rest of the file, in the background
+            } catch {
+                self.error = error
+            }
+        }
+    }
+
+    /// Reopens the file with new format overrides (Format menu): new table, grid, index and search.
+    private func reopen(_ options: CSVOptions) {
+        guard let url, let old = table else { return }
+        Task {
+            do {
+                let loaded = try await CSVTable.load(url, options: options, previous: old)
+                table = loaded
+                // ponytail: the old file's indexAll isn't cancellable, so it finishes in the background.
+                await loaded.index()
             } catch {
                 self.error = error
             }
@@ -136,6 +156,8 @@ struct CSVDocumentView: View {
                         .help(table.isExact ? "Rows" : "Rows (estimated while indexing)")
                     Label(table.header.count.formatted(), systemImage: "rectangle.split.3x1")
                         .help("Columns")
+                    Text("\(table.encoding.name) · \(CSVTable.delimiterName(table.delimiter))")
+                        .help("Encoding and delimiter (change them in the Format menu)")
                     Label(table.byteCount.formatted(.byteCount(style: .file)), systemImage: "internaldrive")
                         .help("File size")
                 } else {
@@ -150,6 +172,54 @@ struct CSVDocumentView: View {
         .lineLimit(1)
         .padding(.horizontal, 12)
         .frame(minWidth: 360, idealWidth: 760, maxWidth: 1000)   // toolbar items take their ideal width
+    }
+}
+
+private struct SearchKey: Hashable {
+    let query: String
+    let table: ObjectIdentifier?
+}
+
+/// Toolbar menu to force the encoding, delimiter and header row; "Automatic" shows what was detected.
+private struct FormatMenu: View {
+    let table: CSVTable
+    let reopen: (CSVOptions) -> Void
+
+    var body: some View {
+        Menu {
+            Picker("Encoding", selection: binding(\.encoding)) {
+                Text(automatic(table.detected.encoding?.name)).tag(CSVEncoding?.none)
+                Divider()
+                ForEach(CSVEncoding.allCases, id: \.self) { Text($0.name).tag(Optional($0)) }
+            }
+            Picker("Delimiter", selection: binding(\.delimiter)) {
+                Text(automatic(table.detected.delimiter.map(CSVTable.delimiterName))).tag(UInt8?.none)
+                Divider()
+                ForEach(CSVTable.delimiters, id: \.self) { Text(CSVTable.delimiterName($0)).tag(Optional($0)) }
+            }
+            Picker("First Row Is Header", selection: binding(\.hasHeader)) {
+                Text(automatic(table.detected.hasHeader.map { $0 ? "Yes" : "No" })).tag(Bool?.none)
+                Divider()
+                Text("Yes").tag(Bool?.some(true))
+                Text("No").tag(Bool?.some(false))
+            }
+        } label: {
+            Label("Format", systemImage: "slider.horizontal.3")
+        }
+        .help("Encoding, delimiter and header row")
+    }
+
+    private func automatic(_ detected: String?) -> String {
+        detected.map { "Automatic (\($0))" } ?? "Automatic"
+    }
+
+    /// One override; setting it reopens the file, keeping the others.
+    private func binding<T>(_ key: WritableKeyPath<CSVOptions, T>) -> Binding<T> {
+        Binding(get: { table.options[keyPath: key] }, set: { value in
+            var options = table.options
+            options[keyPath: key] = value
+            if options != table.options { reopen(options) }
+        })
     }
 }
 
