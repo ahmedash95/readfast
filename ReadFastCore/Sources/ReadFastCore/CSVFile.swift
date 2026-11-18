@@ -32,7 +32,11 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
     /// unclosed quote in a 10 GB file) can't turn into a 10 GB String.
     public static let maxRowBytes = 1 << 20
 
+    /// Sniffed from the preview rows (`, ; \t |`), unless forced in `open`.
     public let delimiter: UInt8
+    /// Whether row 0 is a header (detected from the preview rows, unless forced in
+    /// `open`). `row(_:)` ignores it: row 0 is always the first line.
+    public let hasHeader: Bool
     /// File size in bytes.
     public let byteCount: Int
 
@@ -41,11 +45,12 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
     private let blockSize: Int
     private let index: Mutex<RowIndex>
 
-    public static func open(_ url: URL, previewBytes: Int = defaultPreviewBytes) throws -> CSVFile {
-        try CSVFile(url: url, previewBytes: previewBytes, blockSize: 64 << 10)
+    /// `delimiter` / `hasHeader`: nil = detect from the preview, a value = use it as is.
+    public static func open(_ url: URL, delimiter: UInt8? = nil, hasHeader: Bool? = nil, previewBytes: Int = defaultPreviewBytes) throws -> CSVFile {
+        try CSVFile(url: url, previewBytes: previewBytes, blockSize: 64 << 10, delimiter: delimiter, hasHeader: hasHeader)
     }
 
-    init(url: URL, previewBytes: Int, blockSize: Int) throws {
+    init(url: URL, previewBytes: Int, blockSize: Int, delimiter forcedDelimiter: UInt8? = nil, hasHeader forcedHeader: Bool? = nil) throws {
         let fd = Darwin.open(url.path, O_RDONLY)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         defer { close(fd) } // the mapping outlives the descriptor
@@ -72,9 +77,15 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
         // Preview: index only the first `previewBytes` (whole blocks), serially.
         let preview = min(data.count, max(blockSize, previewBytes / blockSize * blockSize))
         let idx = RowIndex.build(data, upTo: preview, blockSize: blockSize, threads: 1)
-        let first = idx.rowRange(0, data).map { UnsafeRawBufferPointer(rebasing: data[$0]) }
-            ?? UnsafeRawBufferPointer(rebasing: data[..<min(data.count, 64 << 10)])
-        delimiter = Fields.sniffDelimiter(first)
+        // Detection sample: the first rows the preview serves, or, if row 0 doesn't
+        // end inside the preview, its start.
+        var sample = (0..<min(idx.availableRows(data), Fields.sampleRows)).compactMap { i in
+            idx.rowRange(i, data).map { UnsafeRawBufferPointer(rebasing: data[$0.lowerBound..<min($0.upperBound, $0.lowerBound + Fields.sampleRowBytes)]) }
+        }
+        if sample.isEmpty, !data.isEmpty { sample = [UnsafeRawBufferPointer(rebasing: data[..<min(data.count, Fields.sampleRowBytes)])] }
+        let delimiter = forcedDelimiter ?? Fields.sniffDelimiter(sample)
+        self.delimiter = delimiter
+        hasHeader = forcedHeader ?? Fields.detectHeader(sample.map { Fields.split($0, delimiter: delimiter) })
         index = Mutex(idx)
     }
 

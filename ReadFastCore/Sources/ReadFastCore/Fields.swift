@@ -36,17 +36,4 @@ enum Fields {
         }
         return String(decoding: bytes, as: UTF8.self)
     }
-
-    /// The candidate that splits `row` into the most fields. Ties and no match: ','.
-    static func sniffDelimiter(_ row: UnsafeRawBufferPointer) -> UInt8 {
-        let candidates: [UInt8] = [UInt8(ascii: ","), UInt8(ascii: ";"), UInt8(ascii: "\t"), UInt8(ascii: "|")]
-        var counts = [Int](repeating: 0, count: candidates.count)
-        var inside = false
-        for c in row {
-            if c == quote { inside.toggle() }
-            if inside { continue }
-            if let k = candidates.firstIndex(of: c) { counts[k] += 1 }
-        }
-        return candidates[counts.indices.max { counts[$0] < counts[$1] || (counts[$0] == counts[$1] && $0 > $1) }!]
-    }
 }

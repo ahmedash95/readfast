@@ -40,7 +40,7 @@ struct FieldsTests {
 
     @Test(arguments: [("a,b,c", ","), ("a;b;c", ";"), ("a\tb", "\t"), ("a|b", "|"), ("\"x,y,z\";b", ";"), ("single", ","), ("a,b;c", ",")] as [(String, Character)])
     func sniff(row: String, want: Character) {
-        let got = Array(row.utf8).withUnsafeBytes { Fields.sniffDelimiter($0) }
+        let got = Array(row.utf8).withUnsafeBytes { Fields.sniffDelimiter([$0]) }
         #expect(got == want.asciiValue!)
     }
 }

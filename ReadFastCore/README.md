@@ -22,7 +22,8 @@ import ReadFastCore
 
 ```swift
 public final class CSVFile: Sendable {
-    public static func open(_ url: URL, previewBytes: Int = defaultPreviewBytes) throws -> CSVFile
+    public static func open(_ url: URL, delimiter: UInt8? = nil, hasHeader: Bool? = nil,
+                            previewBytes: Int = defaultPreviewBytes) throws -> CSVFile   // nil = detect
 
     public func row(_ i: Int) -> [String]?   // fields of row i; nil = past the end OR not indexed yet
     public var availableRows: Int            // rows row(_:) can return right now
@@ -32,7 +33,8 @@ public final class CSVFile: Sendable {
     public var indexedFraction: Double       // 0...1
     public func indexAll(onProgress: @escaping @Sendable (Double) -> Void = { _ in }) async
 
-    public let delimiter: UInt8              // sniffed from row 0: , ; \t |
+    public let delimiter: UInt8              // detected from preview rows (, ; \t |) or forced
+    public let hasHeader: Bool               // is row 0 a header? detected from preview rows or forced
     public let byteCount: Int                // file size
 
     public static let defaultPreviewBytes: Int   // 512 KB
@@ -49,7 +51,10 @@ public enum RowCount: Equatable, Sendable {
 
 | Thing | Rule |
 |---|---|
-| Row numbering | Row 0 is the first line of the file (normally the header). Data row `i` is `row(i + 1)`; data row count is `rowCount.value - 1`. |
+| Row numbering | Row 0 is always the first line of the file, whatever `hasHeader` says. Let `h = hasHeader ? 1 : 0`: header is `hasHeader ? row(0) : nil` (show `Column 1…` names otherwise), data row `i` is `row(i + h)`, data row count is `max(0, rowCount.value - h)`. |
+| Delimiter | Detected once in `open` from up to 50 preview rows: among `, ; \t \|`, the one whose field count (> 1, quotes respected) is the same on the most rows, then the one with more fields. A title/comment line or ragged rows don't sway it; `1,5;2,7` (decimal commas) picks `;`. No fit (one column, empty file) → `,`. `:` and space are never detected (times and prose fool them); force them if needed. |
+| Header | Detected once in `open` from the same rows: a text cell over a numeric/date column votes header; a number/date over one votes no; a top cell repeated in its text column votes no; duplicate names or 2+ empty names vote no. Ties (e.g. all-text tables) → header. A single row is a header if its cells are distinct non-empty text. Empty file → `false`. |
+| Overrides | `open(url, delimiter: UInt8(ascii: ";"), hasHeader: false)` uses the values as given (any byte except `"`/newlines works as delimiter). Pass nil (default) to detect. To change them from the toolbar, re-`open` the URL (it's ~10 ms) and restart `indexAll`. Forcing only the delimiter still detects the header with that delimiter. |
 | Fields | Already split and unquoted: `"Smith, J"` → `Smith, J`, `""` → `"`. Quoted newlines stay inside the field. Trailing `\r` is stripped. A UTF-8 BOM is skipped. Invalid UTF-8 becomes `�`. |
 | Ragged rows | Rows can have more or fewer fields than the header. Pad/ignore in the UI; never index blindly. |
 | `row(i) == nil` | Either `i >= rowCount` or the index hasn't reached row `i` yet. Check `i < availableRows` to tell them apart; show a placeholder row while indexing. |
@@ -162,7 +167,8 @@ Three things in the current UI that break with a progressive engine:
    a small progress indicator while `!isExact`, then the exact count.
 
 The delimiter is now sniffed (`; \t |` work), so nothing in the UI should assume
-`,`. `DocumentGroup`'s `fileURL` already carries sandbox access; wrapping
+`,`. Row 0 is no longer always the header: use `file.hasHeader` (see the Row
+numbering rule) and offer toolbar overrides for delimiter and header. `DocumentGroup`'s `fileURL` already carries sandbox access; wrapping
 `open` in `startAccessingSecurityScopedResource()` is harmless and covers URLs
 from other sources (launcher recents, drag and drop).
 
@@ -170,7 +176,7 @@ from other sources (launcher recents, drag and drop).
 
 ```sh
 cd ReadFastCore
-swift test                                   # 27 tests, ~3 s
+swift test                                   # 32 tests, ~3 s
 RF_BENCH=1 swift test -c release --filter benchmark   # open / index GB/s on a 1 GB file
 ```
 
@@ -186,7 +192,8 @@ Sources/CReadFast/        C + NEON: 64-byte masks, prefix-XOR quote tracking, pa
 Sources/ReadFastCore/
   CSVFile.swift           public API: mmap, preview, progressive indexAll
   RowIndex.swift          sparse index: newlines per 64 KB block, row lookup = binary search + 1 block scan
-  Fields.swift            row → fields, delimiter sniffing (scalar; only runs on visible rows)
+  Fields.swift            row → fields (scalar; only runs on visible rows)
+  Detection.swift         delimiter + header detection from preview rows (runs once in open)
 ```
 
 Known limits: Intel Macs / x86 simulators use a slower scalar path; a file
