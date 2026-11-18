@@ -23,6 +23,8 @@ struct CSVDocumentView: View {
     @State private var showGoToRow = false
     @State private var goToText = ""
     @State private var jump: RowJump?
+    @State private var query = ""
+    @State private var focusFind = 0
 
     var body: some View {
         Group {
@@ -34,7 +36,7 @@ struct CSVDocumentView: View {
             } else if let table {
                 CSVGrid(table: table, rowCount: table.rowCount, isExact: table.isExact,
                         fontSize: NSFont.systemFontSize * zoom, showRowNumbers: showRowNumbers,
-                        stripes: renderStripes, opaque: renderOpaque, jump: jump)
+                        stripes: renderStripes, opaque: renderOpaque, jump: jump, searchVersion: table.searchVersion)
             } else {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -46,10 +48,22 @@ struct CSVDocumentView: View {
         .toolbar(removing: .title)
         .toolbar {
             ToolbarItem(placement: .principal) { statusPill }
+            ToolbarItem(placement: .primaryAction) {
+                FindField(text: $query, enabled: table?.supportsSearch ?? false, focus: focusFind, submit: stepMatch)
+                    .frame(width: 180)
+            }
         }
         .modifier(WindowBackground())
         .background(TabBarShower())
         .focusedSceneValue(\.showGoToRow, table == nil ? nil : $showGoToRow)
+        .focusedSceneValue(\.find, table?.supportsSearch == true ? FindActions(focus: { focusFind += 1 }, step: stepMatch) : nil)
+        .task(id: query) {
+            guard let table else { return }
+            if !query.isEmpty {
+                do { try await Task.sleep(for: .milliseconds(150)) } catch { return }   // debounce typing
+            }
+            await table.search(query)
+        }
         .alert("Go to Row", isPresented: $showGoToRow) {
             TextField("Row number", text: $goToText)
             Button("Go") {
@@ -72,6 +86,22 @@ struct CSVDocumentView: View {
         }
     }
 
+    private func stepMatch(_ delta: Int) {
+        guard let match = table?.stepMatch(by: delta) else { return NSSound.beep() }
+        jump = RowJump(row: match.row, column: match.column)
+    }
+
+    /// "Searching… 1,234", "12 of 3,481", "No matches"; nil with no query.
+    private func searchStatus(_ table: CSVTable) -> String? {
+        guard !query.isEmpty else { return nil }
+        let total = table.searchTotal.formatted()
+        if table.isSearching { return "Searching… \(total)" }
+        if table.searchTotal == 0 { return "No matches" }
+        let capped = table.searchTotal > table.matches.count ? " (first \(table.matches.count.formatted()))" : ""
+        guard let current = table.currentMatch else { return "\(total) matches" + capped }
+        return "\(current + 1) of \(total)" + capped
+    }
+
     #if DEBUG
     private var renderStripes: Bool { RenderStats.shared.stripes }
     private var renderOpaque: Bool { RenderStats.shared.opaque }
@@ -92,6 +122,10 @@ struct CSVDocumentView: View {
                 if error != nil {
                     Label("Failed", systemImage: "exclamationmark.triangle")
                 } else if let table {
+                    if let status = searchStatus(table) {
+                        Label(status, systemImage: "magnifyingglass")
+                            .help("Find in file: Return / ⌘G next, ⇧Return / ⇧⌘G previous")
+                    }
                     if !table.isExact {
                         ProgressView(value: table.progress)
                             .progressViewStyle(.circular)
@@ -122,12 +156,78 @@ struct CSVDocumentView: View {
 /// A "scroll to this row" request. The id makes asking for the same row twice a new request.
 struct RowJump: Equatable {
     let row: Int
+    /// Set for a search match: scroll to and highlight this field instead of selecting the row.
+    var column: Int?
     let id = UUID()
 }
 
 extension FocusedValues {
     /// The focused document's Go to Row prompt (⌘L); nil when no table is open.
     @Entry var showGoToRow: Binding<Bool>?
+    /// The focused document's Find actions; nil when it can't search.
+    @Entry var find: FindActions?
+}
+
+/// What Edit > Find does in the focused document. `step` takes 1 (next) or -1 (previous).
+struct FindActions {
+    let focus: () -> Void
+    let step: (Int) -> Void
+}
+
+/// Toolbar search field. NSSearchField, not `.searchable`: it can be disabled, and Return can
+/// tell ⇧ apart for Find Previous. Esc clears it.
+private struct FindField: NSViewRepresentable {
+    @Binding var text: String
+    let enabled: Bool
+    /// Bumped to move the keyboard focus here (⌘F).
+    let focus: Int
+    let submit: (Int) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSSearchField {
+        let field = NSSearchField()
+        field.placeholderString = "Find"
+        field.sendsSearchStringImmediately = true
+        field.delegate = context.coordinator
+        field.target = context.coordinator
+        field.action = #selector(Coordinator.changed(_:))
+        return field
+    }
+
+    func updateNSView(_ field: NSSearchField, context: Context) {
+        context.coordinator.parent = self
+        if field.stringValue != text { field.stringValue = text }
+        field.isEnabled = enabled
+        field.toolTip = enabled ? nil : "Find isn't available for UTF-16 files"
+        if context.coordinator.focus != focus {
+            context.coordinator.focus = focus
+            field.window?.makeFirstResponder(field)
+        }
+    }
+
+    final class Coordinator: NSObject, NSSearchFieldDelegate {
+        var parent: FindField
+        var focus: Int
+        init(_ parent: FindField) { self.parent = parent; focus = parent.focus }
+
+        @objc func changed(_ field: NSSearchField) {
+            if parent.text != field.stringValue { parent.text = field.stringValue }
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            switch selector {
+            case #selector(NSResponder.insertNewline(_:)):
+                parent.submit(NSApp.currentEvent?.modifierFlags.contains(.shift) == true ? -1 : 1)
+            case #selector(NSResponder.cancelOperation(_:)):
+                control.stringValue = ""
+                parent.text = ""
+            default:
+                return false
+            }
+            return true
+        }
+    }
 }
 
 /// Icon + value with tight spacing; the default toolbar label style shows only the icon.
@@ -189,6 +289,8 @@ struct CSVGrid: NSViewRepresentable {
     /// Opaque table background instead of the window's blur showing through.
     let opaque: Bool
     let jump: RowJump?
+    /// `table.searchVersion`: matches or the current match changed, so visible rows re-highlight.
+    let searchVersion: Int
 
     func makeCoordinator() -> Coordinator { Coordinator(table: table, rowCount: rowCount) }
 
@@ -261,7 +363,18 @@ struct CSVGrid: NSViewRepresentable {
         }
         if let jump, jump.id != coordinator.lastJump {
             coordinator.lastJump = jump.id
-            (tableView as? GridTableView)?.goTo(row: jump.row, centered: true)
+            (tableView as? GridTableView)?.goTo(row: jump.row, centered: true, select: jump.column == nil)
+            if let field = jump.column,
+               let column = tableView.tableColumns.firstIndex(where: { $0.identifier.rawValue == String(field) }) {
+                tableView.scrollColumnToVisible(column)
+            }
+        }
+        if coordinator.searchVersion != searchVersion {
+            coordinator.searchVersion = searchVersion
+            tableView.enumerateAvailableRowViews { rowView, row in
+                let matched = table.matchedColumns(inRow: row)
+                (rowView as? GridRowView)?.setMatches(matched.columns, current: matched.current)
+            }
         }
         guard coordinator.style.fontSize != fontSize else { return }
         let scale = fontSize / coordinator.style.fontSize
@@ -289,6 +402,7 @@ struct CSVGrid: NSViewRepresentable {
 
         let table: CSVTable
         var lastJump: UUID?
+        var searchVersion = 0
         /// The count the table view was last told about; changes go through noteNumberOfRowsChanged.
         var rowCount: Int
         var isExact = false
@@ -318,6 +432,8 @@ struct CSVGrid: NSViewRepresentable {
             #endif
             // Empty = not indexed yet: drawn blank, filled by the reloadData when indexing reaches it.
             view.configure(tableView: tableView, number: row + 1, fields: fields, style: style, odd: stripes && row % 2 == 1)
+            let matched = table.matchedColumns(inRow: row)
+            view.setMatches(matched.columns, current: matched.current)
             return view
         }
 
@@ -444,10 +560,11 @@ final class GridTableView: NSTableView {
     }
 
     /// Select `row` (clamped) and scroll it into view; `centered` for jumps, edge-following for stepping.
-    func goTo(row: Int, centered: Bool = false) {
+    /// `select: false` only scrolls, leaving selection and keyboard focus alone (search matches).
+    func goTo(row: Int, centered: Bool = false, select: Bool = true) {
         guard numberOfRows > 0 else { return }
         let row = min(max(row, 0), numberOfRows - 1)
-        selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        if select { selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
         if centered, let clip = enclosingScrollView?.contentView {
             let y = rect(ofRow: row).midY - (clip.bounds.height - clip.contentInsets.top) / 2 - clip.contentInsets.top
             clip.scroll(to: NSPoint(x: clip.bounds.minX, y: max(-clip.contentInsets.top, y)))
@@ -455,7 +572,7 @@ final class GridTableView: NSTableView {
         } else {
             scrollRowToVisible(row)
         }
-        window?.makeFirstResponder(self)
+        if select { window?.makeFirstResponder(self) }
     }
 
     private func moveCursor(by delta: Int) {
@@ -530,6 +647,9 @@ final class GridRowView: NSTableRowView {
     private var number = 0
     private var fields: [String] = []
     private var style = GridStyle(fontSize: NSFont.systemFontSize)
+    /// Fields that contain the search query, and the one Find Next/Previous is on.
+    private var matches: [Int] = []
+    private var currentMatch: Int?
 
     convenience init() {
         self.init(frame: .zero)
@@ -542,6 +662,13 @@ final class GridRowView: NSTableRowView {
         self.fields = fields.map(Self.displayText)
         self.style = style
         self.odd = odd
+        needsDisplay = true
+    }
+
+    func setMatches(_ matches: [Int], current: Int?) {
+        guard matches != self.matches || current != currentMatch else { return }
+        self.matches = matches
+        currentMatch = current
         needsDisplay = true
     }
 
@@ -588,8 +715,17 @@ final class GridRowView: NSTableRowView {
             let textRect = NSRect(x: columnRect.minX + 6, y: y, width: max(0, columnRect.width - 12), height: lineHeight)
             if column.identifier == CSVGrid.Coordinator.rowNumberID {
                 (String(number) as NSString).draw(in: textRect, withAttributes: style.number)
-            } else if let i = Int(column.identifier.rawValue), i < fields.count {
-                (fields[i] as NSString).draw(in: textRect, withAttributes: attributes)
+            } else if let i = Int(column.identifier.rawValue) {
+                if !matches.isEmpty, matches.contains(i) {
+                    NSColor.systemYellow.withAlphaComponent(i == currentMatch ? 0.9 : 0.35).setFill()
+                    NSBezierPath(roundedRect: NSRect(x: columnRect.minX, y: 0, width: columnRect.width, height: bounds.height)
+                        .insetBy(dx: 2, dy: 2), xRadius: 4, yRadius: 4).fill()
+                }
+                if i < fields.count {
+                    var attributes = attributes
+                    if i == currentMatch { attributes[.foregroundColor] = NSColor.black }   // readable on the bright yellow
+                    (fields[i] as NSString).draw(in: textRect, withAttributes: attributes)
+                }
             }
         }
     }

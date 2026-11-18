@@ -18,6 +18,7 @@ import SwiftUI
         .commands {
             ZoomCommands()
             GoToRowCommands()
+            FindCommands()
         }
 
         Settings {
@@ -39,6 +40,26 @@ struct ZoomCommands: Commands {
                 .keyboardShortcut("+")
             Button("Zoom Out") { zoom = max(zoom - 0.1, 0.6) }
                 .keyboardShortcut("-")
+        }
+    }
+}
+
+/// Edit > Find, for the toolbar search field. Replaces the text-editing group (Find, Spelling…),
+/// which a read-only viewer has no other use for.
+struct FindCommands: Commands {
+    @FocusedValue(\.find) private var find
+
+    var body: some Commands {
+        CommandGroup(replacing: .textEditing) {
+            Menu("Find") {
+                Button("Find…") { find?.focus() }
+                    .keyboardShortcut("f")
+                Button("Find Next") { find?.step(1) }
+                    .keyboardShortcut("g")
+                Button("Find Previous") { find?.step(-1) }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+            }
+            .disabled(find == nil)
         }
     }
 }
