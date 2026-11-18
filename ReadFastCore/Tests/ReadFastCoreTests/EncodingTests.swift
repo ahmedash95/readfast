@@ -81,6 +81,21 @@ struct EncodingTests {
         }
     }
 
+    @Test func utf8ValidatorMatchesSwift() {
+        var rng = SplitMix(state: 8)
+        let alphabet: [UInt8] = [0x61, 0x2C, 0x00, 0x7F, 0x80, 0xBF, 0xC0, 0xC2, 0xDF, 0xE0, 0xA0, 0x9F, 0xED, 0xEF, 0xF0, 0x90, 0x8F, 0xF4, 0xF5, 0xFF]
+        for _ in 0..<5000 {
+            let n = Int.random(in: 0..<40, using: &rng)
+            // long ASCII prefix exercises the SIMD skip
+            let d = [UInt8](repeating: 0x61, count: Int.random(in: 0..<40, using: &rng))
+                + (0..<n).map { _ in alphabet[Int.random(in: 0..<alphabet.count, using: &rng)] }
+            #expect(rf_utf8_valid(d, d.count, false) == (String(validating: d, as: UTF8.self) != nil), "\(d)")
+        }
+        let cut = Array("a\u{1F600}".utf8).dropLast()
+        #expect(rf_utf8_valid(Array(cut), cut.count, true))
+        #expect(!rf_utf8_valid(Array(cut), cut.count, false))
+    }
+
     @Test func eqMask16MatchesScalar() {
         var rng = SplitMix(state: 16)
         for _ in 0..<1000 {

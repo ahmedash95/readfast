@@ -192,3 +192,42 @@ bool rf_index_units(const uint8_t *p, size_t n, size_t bs, size_t threads, bool 
     dispatch_apply_f(threads, DISPATCH_APPLY_AUTO, &c, scan_worker);
     return c.ends[threads - 1] != 0;
 }
+
+// ── Encoding detection ───────────────────────────────────────────────────────
+
+void rf_count_zeros(const uint8_t *p, size_t n, size_t *even, size_t *odd) {
+    size_t e = 0, o = 0, i = 0;
+    for (; i + 64 <= n; i += 64) {
+        uint64_t m = rf_eq_mask(p + i, 0);
+        e += (size_t)__builtin_popcountll(m & 0x5555555555555555ULL);
+        o += (size_t)__builtin_popcountll(m & 0xAAAAAAAAAAAAAAAAULL);
+    }
+    for (; i < n; i++) if (p[i] == 0) { if (i % 2) o++; else e++; }
+    *even = e;
+    *odd = o;
+}
+
+bool rf_utf8_valid(const uint8_t *p, size_t n, bool allow_cut) {
+    size_t i = 0;
+    while (i < n) {
+#if defined(__ARM_NEON)
+        while (i + 16 <= n && vmaxvq_u8(vld1q_u8(p + i)) < 0x80) i += 16; // skip ASCII runs
+        if (i >= n) break;
+#endif
+        uint8_t c = p[i];
+        if (c < 0x80) { i++; continue; }
+        size_t len;
+        uint8_t lo = 0x80, hi = 0xBF; // 2nd byte range: no overlongs, surrogates or > U+10FFFF
+        if (c >= 0xC2 && c <= 0xDF) len = 2;
+        else if (c >= 0xE0 && c <= 0xEF) { len = 3; if (c == 0xE0) lo = 0xA0; if (c == 0xED) hi = 0x9F; }
+        else if (c >= 0xF0 && c <= 0xF4) { len = 4; if (c == 0xF0) lo = 0x90; if (c == 0xF4) hi = 0x8F; }
+        else return false;
+        for (size_t k = 1; k < len; k++) {
+            if (i + k >= n) return allow_cut;
+            uint8_t d = p[i + k];
+            if (k == 1 ? (d < lo || d > hi) : (d & 0xC0) != 0x80) return false;
+        }
+        i += len;
+    }
+    return true;
+}

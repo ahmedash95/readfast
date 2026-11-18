@@ -40,3 +40,10 @@ int64_t rf_find_newline(const uint8_t *p, size_t n, bool inside, uint64_t k);
 bool rf_index_units(const uint8_t *p, size_t n, size_t block_size, size_t threads, bool start_inside,
                     uint32_t *counts, uint8_t *inside_at, rf_unit unit);
 int64_t rf_find_newline_units(const uint8_t *p, size_t n, bool inside, uint64_t k, rf_unit unit);
+
+/// Zero bytes in [p, p + n) at even and at odd offsets (encoding detection).
+void rf_count_zeros(const uint8_t *p, size_t n, size_t *even, size_t *odd);
+
+/// Whether [p, p + n) is valid UTF-8. `allow_cut`: a sequence cut off by the
+/// end of the buffer counts as valid (the buffer is a sample of a longer file).
+bool rf_utf8_valid(const uint8_t *p, size_t n, bool allow_cut);

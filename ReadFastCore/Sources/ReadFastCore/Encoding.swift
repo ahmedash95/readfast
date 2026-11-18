@@ -54,22 +54,14 @@ public enum CSVEncoding: String, Sendable, CaseIterable {
         for e in [CSVEncoding.utf8, .utf16LE, .utf16BE] where head.starts(with: e.bom) { return e }
 
         // ponytail: zero-byte heuristic; non-Latin BOM-less UTF-16 (e.g. all-CJK) falls through, override covers it.
+        // C/NEON: this runs on every open, so it must stay well under a millisecond
+        guard !head.isEmpty else { return .utf8 }
         let pairs = head.count / 2
         var zeroEven = 0, zeroOdd = 0
-        for i in 0..<pairs {
-            if head[2 * i] == 0 { zeroEven += 1 }
-            if head[2 * i + 1] == 0 { zeroOdd += 1 }
-        }
+        rf_count_zeros(bytes(head), pairs * 2, &zeroEven, &zeroOdd)
         if zeroOdd * 2 > pairs, zeroEven * 8 < zeroOdd { return .utf16LE }
         if zeroEven * 2 > pairs, zeroOdd * 8 < zeroEven { return .utf16BE }
-
-        var end = head.count
-        if !isWholeFile { // drop a character cut by the end of the sample
-            var k = end
-            while k > max(0, end - 3), head[k - 1] & 0xC0 == 0x80 { k -= 1 }
-            if k > 0, head[k - 1] >= 0xC0 { end = k - 1 }
-        }
-        return String(validating: head[..<end], as: UTF8.self) != nil ? .utf8 : .windows1252
+        return rf_utf8_valid(bytes(head), head.count, !isWholeFile) ? .utf8 : .windows1252
     }
 }
 
