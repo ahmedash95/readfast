@@ -39,13 +39,45 @@ public final class CSVFile: Sendable {
 
     public static let defaultPreviewBytes: Int   // 512 KB
     public static let maxRowBytes: Int           // 1 MB; longer rows are cut when read
+
+    public func search(_ query: String, caseSensitive: Bool = false) -> AsyncStream<SearchProgress>
 }
 
 public enum RowCount: Equatable, Sendable {
     case exact(Int), estimated(Int)
     public var value: Int
 }
+
+public struct SearchMatch: Hashable, Sendable { public let row, column: Int }  // row(row)[column]
+public struct SearchProgress: Sendable {
+    public let matches: [SearchMatch]   // new since the previous step, in file order
+    public let fraction: Double         // 0...1 scanned
+    public let total: Int               // so far; the total on the last step
+    public let isComplete: Bool         // last step
+}
 ```
+
+### Find in file
+
+```swift
+searchTask = Task {
+    var hits: [SearchMatch] = []
+    for await step in file.search(query) {   // one step per 16 MB, on every core
+        hits += step.matches                 // show them right away
+        progress = step.fraction
+    }
+}
+searchTask.cancel()                          // new query: the scan stops within a few ms
+```
+
+| Thing | Rule |
+|---|---|
+| What matches | Cells whose **displayed** text (what `row(_:)` returns) contains the query: inside quoted fields too, `""` matches a `"` in the query, but the delimiter, outer quotes, row-ending newline and trailing `\r` are not text. A match never spans two cells or rows. One match per cell. |
+| Case | `caseSensitive: false` folds ASCII letters only; `é` doesn't match `É`. Other bytes compare exactly. |
+| Order | Matches arrive in file order (row, then column), steps front to back. |
+| Indexing | Independent of `indexAll`: the search counts rows itself (same quote rules), so it works right after `open`. A match can be in a row `row(_:)` can't serve yet (`row >= availableRows`); it fills in when indexing gets there. |
+| Empty query | One complete step with no matches. |
+| Speed | ~10 GB/s warm when matches are rare; ~2.5 GB/s when every row matches (columns are counted serially per match). |
 
 ### Semantics to get right
 
@@ -176,8 +208,8 @@ from other sources (launcher recents, drag and drop).
 
 ```sh
 cd ReadFastCore
-swift test                                   # 32 tests, ~3 s
-RF_BENCH=1 swift test -c release --filter benchmark   # open / index GB/s on a 1 GB file
+swift test                                   # all tests, ~5 s
+RF_BENCH=1 swift test -c release --filter benchmark   # open / index / search GB/s on a 1 GB file
 ```
 
 Tests use tiny block and segment sizes, so 2 KB inputs exercise the same paths as
@@ -188,13 +220,17 @@ segments, preview → progressive → exact index, a 4 GB sparse file opening in
 ## Layout (for changing the engine, not for using it)
 
 ```
-Sources/CReadFast/        C + NEON: 64-byte masks, prefix-XOR quote tracking, parallel block index
+Sources/CReadFast/        C + NEON: 64-byte masks, prefix-XOR quote tracking, parallel block index;
+                          search.c: parallel substring scan, one hit per cell
 Sources/ReadFastCore/
   CSVFile.swift           public API: mmap, preview, progressive indexAll
   RowIndex.swift          sparse index: newlines per 64 KB block, row lookup = binary search + 1 block scan
   Fields.swift            row → fields (scalar; only runs on visible rows)
   Detection.swift         delimiter + header detection from preview rows (runs once in open)
+  Search.swift            find in file: streams matches; columns and quote/delimiter checks per hit
 ```
 
 Known limits: Intel Macs / x86 simulators use a slower scalar path; a file
-truncated by another process while open crashes on read (SIGBUS).
+truncated by another process while open crashes on read (SIGBUS). Search
+matches raw bytes, so it also finds cells past the 1 MB `maxRowBytes` cut, and
+a query containing `�` doesn't match invalid UTF-8 shown as `�`.

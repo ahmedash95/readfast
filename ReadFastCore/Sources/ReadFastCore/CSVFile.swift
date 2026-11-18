@@ -41,7 +41,7 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
     public let byteCount: Int
 
     private let region: UnsafeMutableRawPointer?
-    private let data: UnsafeRawBufferPointer // the mapped bytes after a UTF-8 BOM
+    let data: UnsafeRawBufferPointer // the mapped bytes after a UTF-8 BOM
     private let blockSize: Int
     private let index: Mutex<RowIndex>
 

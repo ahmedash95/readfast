@@ -130,6 +130,13 @@ struct CSVFileTests {
             let s = Double((clock.now - t).components.attoseconds) / 1e18 + Double((clock.now - t).components.seconds)
             print("index \(threads) threads: \(String(format: "%.2f", Double(g.byteCount) / s / 1e9)) GB/s, \(g.rowCount)")
         }
+        for (q, cs) in [("zebra", false), ("Smith", true), ("smith", false)] { // none, every row, every row
+            t = clock.now
+            var total = 0
+            for await step in f.search(q, caseSensitive: cs) { total = step.total }
+            let s = Double((clock.now - t).components.attoseconds) / 1e18 + Double((clock.now - t).components.seconds)
+            print("search \(q.debugDescription) cs=\(cs): \(String(format: "%.2f", Double(f.byteCount) / s / 1e9)) GB/s, \(total) matches")
+        }
         t = clock.now
         for i in stride(from: 0, to: f.availableRows, by: max(1, f.availableRows / 1000)) { _ = f.row(i) }
         print("1000 preview rows: \(clock.now - t)")
