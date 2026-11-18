@@ -10,11 +10,14 @@ typedef struct {
     int64_t cell;
     int64_t row_start;
     uint64_t row;
+    /// The cell shows text after a closing quote (`"ab"cd` shows `abcd`), so it
+    /// may show the needle without containing its bytes: the caller checks it.
+    bool check;
 } rf_hit;
 
-/// Carried from one rf_search call to the next. Start with {false, 0, 0, 0, -1}.
+/// Carried from one rf_search call to the next. Start with {RF_FIELD, 0, 0, 0, -1}.
 typedef struct {
-    bool inside;           // `from` is inside quotes
+    uint8_t state;         // quote-rule state before `from` (RF_* in readfast.h)
     uint64_t rows;         // row-ending newlines before `from`
     int64_t row_start;     // start of the row containing `from`
     int64_t cell_start;    // start of the cell containing `from`
@@ -24,9 +27,10 @@ typedef struct {
 /// Finds `needle` (raw bytes) starting in [from, to) of p[0..<n] on up to
 /// `threads` cores; a match may run past `to` (up to n). `fold`: ASCII
 /// case-insensitive, other bytes compare exactly. Cells are split at `delim`
-/// and '\n' outside quotes. Hits are in file order, at most one per cell (the
-/// cell where the match starts); a match running into the next cell is still
-/// reported, so callers verify when the needle holds a delimiter or newline.
+/// and `nl` outside quoted fields (readfast.h's quote rule). Hits are in file
+/// order, at most one per cell (the cell where the match starts); a match
+/// running into the next cell is still reported, so callers verify when the
+/// needle holds a delimiter or newline.
 /// *out is malloc'd (NULL when there are no hits); the caller frees it.
 size_t rf_search(const uint8_t *p, size_t n, size_t from, size_t to, const uint8_t *needle, size_t len,
-                 bool fold, uint8_t delim, size_t threads, rf_search_state *st, rf_hit **out);
+                 bool fold, uint8_t delim, uint8_t nl, size_t threads, rf_search_state *st, rf_hit **out);

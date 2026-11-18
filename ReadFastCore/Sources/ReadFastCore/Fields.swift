@@ -5,6 +5,8 @@ enum Fields {
 
     /// Fields of `row`, outer quotes removed and "" turned into ".
     /// An empty row is one empty field; "a," is two fields.
+    /// Same quote rule as the scan (readfast.h): a quote opens a quoted field
+    /// only as a field's first unit; anywhere else it's a plain unit.
     static func split(_ row: UnsafeRawBufferPointer, delimiter: UInt8, encoding: CSVEncoding = .utf8) -> [String] {
         switch encoding {
         case .utf8: split(row, delimiter) { String(decoding: UnsafeRawBufferPointer(rebasing: $0), as: UTF8.self) }
@@ -19,38 +21,46 @@ enum Fields {
     ) -> [String] where C.Index == Int, C.Element: FixedWidthInteger {
         let quote = C.Element(quote), delimiter = C.Element(delimiter)
         var out: [String] = []
-        var start = 0, quotes = 0, inside = false
+        var start = 0, quoted = false, inside = false, closed = false
         for i in 0...row.count {
             if i < row.count {
                 let c = row[i]
-                if c == quote { inside.toggle(); quotes += 1; continue }
+                let afterClose = closed
+                closed = false
+                if c == quote, i == start || inside || afterClose {
+                    // opens, closes, or (right after a close) is the 2nd half of ""
+                    quoted = true
+                    closed = inside
+                    inside.toggle()
+                    continue
+                }
                 if c != delimiter || inside { continue }
             }
-            out.append(field(row, start..<i, quotes: quotes, decode: decode))
+            out.append(quoted && !inside ? unquote(row, start..<i, decode: decode) : decode(row[start..<i]))
             start = i + 1
-            quotes = 0
+            quoted = false
         }
         return out
     }
 
-    private static func field<C: RandomAccessCollection>(
-        _ row: C, _ r: Range<Int>, quotes: Int, decode: (C.SubSequence) -> String
+    /// `"a ""b"" c"rest` → `a "b" crest`. Only called on closed quoted fields:
+    /// decodes the runs between quotes, "" adding one quote.
+    private static func unquote<C: RandomAccessCollection>(
+        _ row: C, _ r: Range<Int>, decode: (C.SubSequence) -> String
     ) -> String where C.Index == Int, C.Element: FixedWidthInteger {
         let quote = C.Element(quote)
-        guard r.count >= 2, row[r.lowerBound] == quote, row[r.upperBound - 1] == quote else { return decode(row[r]) }
-        let content = (r.lowerBound + 1)..<(r.upperBound - 1)
-        guard quotes > 2 else { return decode(row[content]) }
-        // "" → ": decode the runs between doubled quotes, each keeping one of the two
-        var s = "", piece = content.lowerBound, i = content.lowerBound
-        while i < content.upperBound {
-            if row[i] == quote, i + 1 < content.upperBound, row[i + 1] == quote {
-                s += decode(row[piece...i])
+        var s = "", piece = r.lowerBound + 1, i = piece
+        while i < r.upperBound {
+            guard row[i] == quote else { i += 1; continue }
+            s += decode(row[piece..<i])
+            if i + 1 < r.upperBound, row[i + 1] == quote {
+                s += "\""
                 i += 2
                 piece = i
             } else {
-                i += 1
+                return s + decode(row[(i + 1)..<r.upperBound]) // the closing quote; the rest is plain
             }
         }
-        return s + decode(row[piece..<content.upperBound])
+        return s + decode(row[piece..<r.upperBound])
     }
 }

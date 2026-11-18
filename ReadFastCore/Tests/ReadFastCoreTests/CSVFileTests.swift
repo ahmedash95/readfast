@@ -94,8 +94,54 @@ struct CSVFileTests {
         #expect(!f.isIndexed)
     }
 
+    /// Indexes `text` the way a big file is: tiny preview, blocks and segments, 4 threads.
+    func indexed(_ text: String) async throws -> CSVFile {
+        let url = try tempFile(Array(text.utf8))
+        defer { try? FileManager.default.removeItem(at: url) }
+        let f = try CSVFile(url: url, previewBytes: 1024, blockSize: 256)
+        await f.indexAll(threads: 4, segmentBytes: 4096)
+        return f
+    }
+
+    @Test func strayQuoteDoesNotSwallowTheRest() async throws {
+        var text = "id,size,note\n12,5\" pipe,ok\n"
+        for i in 2...3000 { text += i % 5 == 0 ? "\(i),\"a, \"\"b\"\"\nc\",x\n" : "\(i),7\"\",plain\n" }
+        let f = try await indexed(text)
+        #expect(f.rowCount == .exact(3001))
+        #expect(f.row(1) == ["12", "5\" pipe", "ok"])
+        for i in 2...3000 {
+            #expect(f.row(i) == (i % 5 == 0 ? ["\(i)", "a, \"b\"\nc", "x"] : ["\(i)", "7\"\"", "plain"]), "row \(i)")
+        }
+    }
+
+    @Test func unterminatedQuoteAtEOF() async throws {
+        let f = try await indexed("a,b\n1,\"open\nstill open")
+        #expect(f.rowCount == .exact(2))
+        #expect(f.row(1) == ["1", "\"open\nstill open"])
+    }
+
+    @Test func classicMacLineEndings() async throws {
+        var text = "id,note\r"
+        for i in 1...2000 { text += i % 3 == 0 ? "\(i),\"two\rlines\nok\"\r" : "\(i),x\r" }
+        let f = try await indexed(text)
+        #expect(f.indexSnapshot.newline == UInt8(ascii: "\r"))
+        #expect(f.rowCount == .exact(2001))
+        #expect(f.row(0) == ["id", "note"])
+        for i in 1...2000 { #expect(f.row(i) == ["\(i)", i % 3 == 0 ? "two\rlines\nok" : "x"], "row \(i)") }
+    }
+
+    @Test func mixedCRLFAndLF() async throws {
+        var text = "id;v\r\n"
+        for i in 1...2000 { text += "\(i);\"q\r\nq\"" + (i % 2 == 0 ? "\r\n" : "\n") }
+        let f = try await indexed(text)
+        #expect(f.indexSnapshot.newline == UInt8(ascii: "\n"))
+        #expect(f.delimiter == UInt8(ascii: ";"))
+        #expect(f.rowCount == .exact(2001))
+        for i in 1...2000 { #expect(f.row(i) == ["\(i)", "q\r\nq"], "row \(i)") }
+    }
+
     @Test func runawayRowIsCut() async throws {
-        // an unclosed quote swallows the rest of the file into one row
+        // an unclosed quote at a field start swallows the rest of the file into one row
         let big = Array("h\n\"".utf8) + [UInt8](repeating: UInt8(ascii: "x"), count: 3 << 20)
         let url = try tempFile(big)
         defer { try? FileManager.default.removeItem(at: url) }

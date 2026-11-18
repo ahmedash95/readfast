@@ -1,3 +1,4 @@
+import CReadFast
 import Darwin
 import Dispatch
 import Foundation
@@ -45,6 +46,7 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
     private let region: UnsafeMutableRawPointer?
     let data: UnsafeRawBufferPointer // the mapped bytes after the BOM (whole units for UTF-16)
     private let blockSize: Int
+    let newline: UInt8 // row terminator: '\n', or '\r' for classic Mac files
     private let index: Mutex<RowIndex>
 
     /// nil = detect from the preview; a value = use it as is.
@@ -81,17 +83,29 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
         byteCount = len
         self.blockSize = blockSize
 
-        // Preview: index only the first `previewBytes` (whole blocks), serially.
+        // 1. Delimiter, before indexing: the scan needs it (a quote only opens a
+        // field at a field start). Sniffed from the raw head, each candidate
+        // splitting rows and fields with its own quote rule.
+        let sniffHead = UnsafeRawBufferPointer(rebasing: data[..<min(data.count, previewBytes, Fields.sampleBytes)])
+        let delimiter = forcedDelimiter ?? Fields.sniffDelimiter([sniffHead], encoding: encoding, complete: sniffHead.count == data.count)
+        self.delimiter = delimiter
+
+        // 2. Preview: index only the first `previewBytes` (whole blocks), serially.
         let preview = min(data.count, max(blockSize, previewBytes / blockSize * blockSize))
-        let idx = RowIndex.build(data, upTo: preview, blockSize: blockSize, threads: 1, encoding: encoding)
-        // Detection sample: the first rows the preview serves, or, if row 0 doesn't
-        // end inside the preview, its start.
+        var idx = RowIndex.build(data, upTo: preview, blockSize: blockSize, threads: 1, encoding: encoding, delimiter: delimiter)
+        // Classic Mac line endings: '\r' but no row-ending '\n' in the preview.
+        if idx.newlines == 0, preview > 0, rf_count_units(bytes(data), preview, UInt8(ascii: "\r"), encoding.scanUnit) > 0 {
+            idx = RowIndex.build(data, upTo: preview, blockSize: blockSize, threads: 1, encoding: encoding,
+                                 delimiter: delimiter, newline: UInt8(ascii: "\r"))
+        }
+        newline = idx.newline
+
+        // 3. Header, from the first rows the preview serves (or, if row 0 doesn't
+        // end inside the preview, its start).
         var sample = (0..<min(idx.availableRows(data), Fields.sampleRows)).compactMap { i in
             idx.rowRange(i, data).map { UnsafeRawBufferPointer(rebasing: data[$0.lowerBound..<min($0.upperBound, $0.lowerBound + Fields.sampleRowBytes)]) }
         }
         if sample.isEmpty, !data.isEmpty { sample = [UnsafeRawBufferPointer(rebasing: data[..<min(data.count, Fields.sampleRowBytes)])] }
-        let delimiter = forcedDelimiter ?? Fields.sniffDelimiter(sample, encoding: encoding)
-        self.delimiter = delimiter
         hasHeader = forcedHeader ?? Fields.detectHeader(sample.map { Fields.split($0, delimiter: delimiter, encoding: encoding) })
         index = Mutex(idx)
     }
@@ -139,7 +153,8 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
         if isIndexed { return }
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
-                _ = RowIndex.build(self.data, upTo: self.data.count, blockSize: self.blockSize, threads: threads, encoding: self.encoding, segmentBytes: segmentBytes) { partial in
+                _ = RowIndex.build(self.data, upTo: self.data.count, blockSize: self.blockSize, threads: threads, encoding: self.encoding,
+                                   delimiter: self.delimiter, newline: self.newline, segmentBytes: segmentBytes) { partial in
                     // never step back, e.g. behind a bigger preview or a concurrent call
                     self.index.withLock { if partial.scanned > $0.scanned { $0 = partial } }
                     onProgress(partial.fraction)
