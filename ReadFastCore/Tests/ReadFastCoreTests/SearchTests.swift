@@ -169,4 +169,16 @@ struct SearchTests {
         #expect(scanned.load(ordering: .relaxed) == stoppedAt) // not still running
         #expect(stoppedAt < f.byteCount / 2, "scanned \(stoppedAt) of \(f.byteCount)")
     }
+
+    @Test func utf16FilesDontSupportSearchYet() async throws {
+        let text = "id\tname\n1\tSmith\n"
+        let url = try tempFile([0xFF, 0xFE] + Array(text.utf16).flatMap { [UInt8($0 & 0xFF), UInt8($0 >> 8)] })
+        defer { try? FileManager.default.removeItem(at: url) }
+        let f = try CSVFile.open(url)
+        #expect(f.encoding == .utf16LE)
+        #expect(!f.supportsSearch)
+        var steps: [SearchProgress] = []
+        for await step in f.search("Smith") { steps.append(step) }
+        #expect(steps.count == 1 && steps[0].isComplete && steps[0].total == 0)
+    }
 }

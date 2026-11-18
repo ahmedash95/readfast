@@ -14,20 +14,28 @@ extension Fields {
     /// A title line, ragged rows and quoted delimiters don't sway it. A comma
     /// that only ever sits between digits (`1,5;2,7`) is a decimal comma: ';'
     /// wins any tie with it. Nothing fits (one column, empty): ','.
-    static func sniffDelimiter(_ rows: [UnsafeRawBufferPointer]) -> UInt8 {
+    static func sniffDelimiter(_ rows: [UnsafeRawBufferPointer], encoding: CSVEncoding = .utf8) -> UInt8 {
+        encoding.unitWidth == 2 ? sniffDelimiter(units: rows.map(encoding.units)) : sniffDelimiter(units: rows)
+    }
+
+    /// Over code units, so UTF-16 rows are read as 16-bit units (a CJK unit's
+    /// bytes can look like ',' or ';').
+    private static func sniffDelimiter<C: RandomAccessCollection>(units rows: [C]) -> UInt8
+    where C.Element: FixedWidthInteger, C.Index == Int {
         let cands = delimiterCandidates
         var counts = [[Int: Int]](repeating: [:], count: cands.count) // fields per row -> rows
         var decimalCommas = true
         for row in rows {
             var n = [Int](repeating: 1, count: cands.count)
             var inside = false
-            for i in 0..<row.count {
-                let c = row[i]
-                if c == quote { inside.toggle(); continue }
-                if inside { continue }
+            for i in row.indices {
+                let unit = row[i]
+                if unit == quote { inside.toggle(); continue }
+                if inside || unit >= 0x80 { continue }
+                let c = UInt8(unit)
                 guard let k = cands.firstIndex(of: c) else { continue }
                 n[k] += 1
-                if k == 0, !(i > 0 && i + 1 < row.count && isDigit(row[i - 1]) && isDigit(row[i + 1])) { decimalCommas = false }
+                if k == 0, !(i > row.startIndex && i + 1 < row.endIndex && isDigit(row[i - 1]) && isDigit(row[i + 1])) { decimalCommas = false }
             }
             for k in cands.indices { counts[k][n[k], default: 0] += 1 }
         }
@@ -43,7 +51,7 @@ extension Fields {
         return cands[best ?? 0]
     }
 
-    private static func isDigit(_ c: UInt8) -> Bool { c >= 48 && c <= 57 }
+    private static func isDigit<T: FixedWidthInteger>(_ c: T) -> Bool { c >= 48 && c <= 57 }
 
     enum Kind { case text, number, date }
 

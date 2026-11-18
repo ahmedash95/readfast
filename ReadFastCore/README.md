@@ -22,7 +22,7 @@ import ReadFastCore
 
 ```swift
 public final class CSVFile: Sendable {
-    public static func open(_ url: URL, delimiter: UInt8? = nil, hasHeader: Bool? = nil,
+    public static func open(_ url: URL, encoding: CSVEncoding? = nil, delimiter: UInt8? = nil, hasHeader: Bool? = nil,
                             previewBytes: Int = defaultPreviewBytes) throws -> CSVFile   // nil = detect
 
     public func row(_ i: Int) -> [String]?   // fields of row i; nil = past the end OR not indexed yet
@@ -35,6 +35,8 @@ public final class CSVFile: Sendable {
 
     public let delimiter: UInt8              // detected from preview rows (, ; \t |) or forced
     public let hasHeader: Bool               // is row 0 a header? detected from preview rows or forced
+    public let encoding: CSVEncoding         // detected at open unless given
+    public var supportsSearch: Bool          // false for UTF-16 (search is byte-based for now)
     public let byteCount: Int                // file size
 
     public static let defaultPreviewBytes: Int   // 512 KB
@@ -54,6 +56,10 @@ public struct SearchProgress: Sendable {
     public let fraction: Double         // 0...1 scanned
     public let total: Int               // so far; the total on the last step
     public let isComplete: Bool         // last step
+}
+
+public enum CSVEncoding: String, Sendable, CaseIterable {
+    case utf8, utf16LE, utf16BE, windows1252
 }
 ```
 
@@ -87,7 +93,8 @@ searchTask.cancel()                          // new query: the scan stops within
 | Delimiter | Detected once in `open` from up to 50 preview rows: among `, ; \t \|`, the one whose field count (> 1, quotes respected) is the same on the most rows, then the one with more fields. A title/comment line or ragged rows don't sway it; `1,5;2,7` (decimal commas) picks `;`. No fit (one column, empty file) → `,`. `:` and space are never detected (times and prose fool them); force them if needed. |
 | Header | Detected once in `open` from the same rows: a text cell over a numeric/date column votes header; a number/date over one votes no; a top cell repeated in its text column votes no; duplicate names or 2+ empty names vote no. Ties (e.g. all-text tables) → header. A single row is a header if its cells are distinct non-empty text. Empty file → `false`. |
 | Overrides | `open(url, delimiter: UInt8(ascii: ";"), hasHeader: false)` uses the values as given (any byte except `"`/newlines works as delimiter). Pass nil (default) to detect. To change them from the toolbar, re-`open` the URL (it's ~10 ms) and restart `indexAll`. Forcing only the delimiter still detects the header with that delimiter. |
-| Fields | Already split and unquoted: `"Smith, J"` → `Smith, J`, `""` → `"`. Quoted newlines stay inside the field. Trailing `\r` is stripped. A UTF-8 BOM is skipped. Invalid UTF-8 becomes `�`. |
+| Fields | Already split and unquoted: `"Smith, J"` → `Smith, J`, `""` → `"`. Quoted newlines stay inside the field. Trailing `\r` is stripped. A BOM is skipped. Invalid UTF-8 becomes `�`. |
+| Encoding | Detected from the first `previewBytes`: UTF-8 / UTF-16 LE / UTF-16 BE BOM, then BOM-less UTF-16 (zero bytes on one side of most units), then valid UTF-8, else Windows-1252. Offer a menu that reopens with `open(url, encoding:)`: a file that is ASCII in the sample but 1252 later is read as UTF-8 (`�`), and BOM-less UTF-16 with no Latin text (e.g. all CJK) isn't detected. UTF-16 is scanned in place as 16-bit units (same NEON masks, 64 units per mask), never transcoded. |
 | Ragged rows | Rows can have more or fewer fields than the header. Pad/ignore in the UI; never index blindly. |
 | `row(i) == nil` | Either `i >= rowCount` or the index hasn't reached row `i` yet. Check `i < availableRows` to tell them apart; show a placeholder row while indexing. |
 | Row count | `.estimated` is projected from the bytes scanned so far and improves after each segment; it can move, so the scroll height may change slightly until `.exact`. |
@@ -228,6 +235,7 @@ Sources/ReadFastCore/
   Fields.swift            row → fields (scalar; only runs on visible rows)
   Detection.swift         delimiter + header detection from preview rows (runs once in open)
   Search.swift            find in file: streams matches; columns and quote/delimiter checks per hit
+  Encoding.swift          CSVEncoding: detection, Windows-1252 table
 ```
 
 Known limits: Intel Macs / x86 simulators use a slower scalar path; a file

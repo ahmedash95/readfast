@@ -37,20 +37,24 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
     /// Whether row 0 is a header (detected from the preview rows, unless forced in
     /// `open`). `row(_:)` ignores it: row 0 is always the first line.
     public let hasHeader: Bool
+    /// Detected from the first `previewBytes` at open, unless given to `open`.
+    public let encoding: CSVEncoding
     /// File size in bytes.
     public let byteCount: Int
 
     private let region: UnsafeMutableRawPointer?
-    let data: UnsafeRawBufferPointer // the mapped bytes after a UTF-8 BOM
+    let data: UnsafeRawBufferPointer // the mapped bytes after the BOM (whole units for UTF-16)
     private let blockSize: Int
     private let index: Mutex<RowIndex>
 
-    /// `delimiter` / `hasHeader`: nil = detect from the preview, a value = use it as is.
-    public static func open(_ url: URL, delimiter: UInt8? = nil, hasHeader: Bool? = nil, previewBytes: Int = defaultPreviewBytes) throws -> CSVFile {
-        try CSVFile(url: url, previewBytes: previewBytes, blockSize: 64 << 10, delimiter: delimiter, hasHeader: hasHeader)
+    /// nil = detect from the preview; a value = use it as is.
+    public static func open(_ url: URL, encoding: CSVEncoding? = nil, delimiter: UInt8? = nil, hasHeader: Bool? = nil,
+                            previewBytes: Int = defaultPreviewBytes) throws -> CSVFile {
+        try CSVFile(url: url, previewBytes: previewBytes, blockSize: 64 << 10, encoding: encoding, delimiter: delimiter, hasHeader: hasHeader)
     }
 
-    init(url: URL, previewBytes: Int, blockSize: Int, delimiter forcedDelimiter: UInt8? = nil, hasHeader forcedHeader: Bool? = nil) throws {
+    init(url: URL, previewBytes: Int, blockSize: Int, encoding: CSVEncoding? = nil,
+         delimiter forcedDelimiter: UInt8? = nil, hasHeader forcedHeader: Bool? = nil) throws {
         let fd = Darwin.open(url.path, O_RDONLY)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         defer { close(fd) } // the mapping outlives the descriptor
@@ -68,24 +72,27 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
             region = nil
         }
         let all = UnsafeRawBufferPointer(start: region, count: len)
-        let bom = len >= 3 && all[0] == 0xEF && all[1] == 0xBB && all[2] == 0xBF
-        let data = bom ? UnsafeRawBufferPointer(rebasing: all[3...]) : all
+        let head = UnsafeRawBufferPointer(rebasing: all[..<min(len, previewBytes)])
+        let encoding = encoding ?? CSVEncoding.detect(head, isWholeFile: head.count == len)
+        self.encoding = encoding
+        var data = all.starts(with: encoding.bom) ? UnsafeRawBufferPointer(rebasing: all[encoding.bom.count...]) : all
+        if encoding.unitWidth == 2 { data = UnsafeRawBufferPointer(rebasing: data[..<(data.count & ~1)]) } // drop a stray odd byte
         self.data = data
         byteCount = len
         self.blockSize = blockSize
 
         // Preview: index only the first `previewBytes` (whole blocks), serially.
         let preview = min(data.count, max(blockSize, previewBytes / blockSize * blockSize))
-        let idx = RowIndex.build(data, upTo: preview, blockSize: blockSize, threads: 1)
+        let idx = RowIndex.build(data, upTo: preview, blockSize: blockSize, threads: 1, encoding: encoding)
         // Detection sample: the first rows the preview serves, or, if row 0 doesn't
         // end inside the preview, its start.
         var sample = (0..<min(idx.availableRows(data), Fields.sampleRows)).compactMap { i in
             idx.rowRange(i, data).map { UnsafeRawBufferPointer(rebasing: data[$0.lowerBound..<min($0.upperBound, $0.lowerBound + Fields.sampleRowBytes)]) }
         }
         if sample.isEmpty, !data.isEmpty { sample = [UnsafeRawBufferPointer(rebasing: data[..<min(data.count, Fields.sampleRowBytes)])] }
-        let delimiter = forcedDelimiter ?? Fields.sniffDelimiter(sample)
+        let delimiter = forcedDelimiter ?? Fields.sniffDelimiter(sample, encoding: encoding)
         self.delimiter = delimiter
-        hasHeader = forcedHeader ?? Fields.detectHeader(sample.map { Fields.split($0, delimiter: delimiter) })
+        hasHeader = forcedHeader ?? Fields.detectHeader(sample.map { Fields.split($0, delimiter: delimiter, encoding: encoding) })
         index = Mutex(idx)
     }
 
@@ -113,7 +120,7 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
         let idx = index.withLock { $0 }
         guard let r = idx.rowRange(i, data) else { return nil }
         let cut = r.lowerBound..<min(r.upperBound, r.lowerBound + Self.maxRowBytes)
-        return Fields.split(UnsafeRawBufferPointer(rebasing: data[cut]), delimiter: delimiter)
+        return Fields.split(UnsafeRawBufferPointer(rebasing: data[cut]), delimiter: delimiter, encoding: encoding)
     }
 
     /// Share of the file indexed so far, 0...1.
@@ -132,7 +139,7 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
         if isIndexed { return }
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
-                _ = RowIndex.build(self.data, upTo: self.data.count, blockSize: self.blockSize, threads: threads, segmentBytes: segmentBytes) { partial in
+                _ = RowIndex.build(self.data, upTo: self.data.count, blockSize: self.blockSize, threads: threads, encoding: self.encoding, segmentBytes: segmentBytes) { partial in
                     // never step back, e.g. behind a bigger preview or a concurrent call
                     self.index.withLock { if partial.scanned > $0.scanned { $0 = partial } }
                     onProgress(partial.fraction)

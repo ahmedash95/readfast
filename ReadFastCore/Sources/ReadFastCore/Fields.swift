@@ -5,7 +5,19 @@ enum Fields {
 
     /// Fields of `row`, outer quotes removed and "" turned into ".
     /// An empty row is one empty field; "a," is two fields.
-    static func split(_ row: UnsafeRawBufferPointer, delimiter: UInt8) -> [String] {
+    static func split(_ row: UnsafeRawBufferPointer, delimiter: UInt8, encoding: CSVEncoding = .utf8) -> [String] {
+        switch encoding {
+        case .utf8: split(row, delimiter) { String(decoding: UnsafeRawBufferPointer(rebasing: $0), as: UTF8.self) }
+        case .windows1252: split(row, delimiter) { Windows1252.decode(UnsafeRawBufferPointer(rebasing: $0)) }
+        case .utf16LE, .utf16BE: split(encoding.units(row), delimiter) { String(decoding: $0, as: UTF16.self) }
+        }
+    }
+
+    /// The split over code units (bytes or UTF-16 units, 0-based); `decode` turns a slice into a String.
+    private static func split<C: RandomAccessCollection>(
+        _ row: C, _ delimiter: UInt8, decode: (C.SubSequence) -> String
+    ) -> [String] where C.Index == Int, C.Element: FixedWidthInteger {
+        let quote = C.Element(quote), delimiter = C.Element(delimiter)
         var out: [String] = []
         var start = 0, quotes = 0, inside = false
         for i in 0...row.count {
@@ -14,26 +26,31 @@ enum Fields {
                 if c == quote { inside.toggle(); quotes += 1; continue }
                 if c != delimiter || inside { continue }
             }
-            out.append(field(UnsafeRawBufferPointer(rebasing: row[start..<i]), quotes: quotes))
+            out.append(field(row, start..<i, quotes: quotes, decode: decode))
             start = i + 1
             quotes = 0
         }
         return out
     }
 
-    private static func field(_ raw: UnsafeRawBufferPointer, quotes: Int) -> String {
-        let quoted = raw.count >= 2 && raw[0] == quote && raw[raw.count - 1] == quote
-        guard quoted else { return String(decoding: raw, as: UTF8.self) }
-        let content = UnsafeRawBufferPointer(rebasing: raw[1..<(raw.count - 1)])
-        guard quotes > 2 else { return String(decoding: content, as: UTF8.self) }
-        var bytes: [UInt8] = []
-        bytes.reserveCapacity(content.count)
-        var i = 0
-        while i < content.count {
-            bytes.append(content[i])
-            if content[i] == quote, i + 1 < content.count, content[i + 1] == quote { i += 1 }
-            i += 1
+    private static func field<C: RandomAccessCollection>(
+        _ row: C, _ r: Range<Int>, quotes: Int, decode: (C.SubSequence) -> String
+    ) -> String where C.Index == Int, C.Element: FixedWidthInteger {
+        let quote = C.Element(quote)
+        guard r.count >= 2, row[r.lowerBound] == quote, row[r.upperBound - 1] == quote else { return decode(row[r]) }
+        let content = (r.lowerBound + 1)..<(r.upperBound - 1)
+        guard quotes > 2 else { return decode(row[content]) }
+        // "" → ": decode the runs between doubled quotes, each keeping one of the two
+        var s = "", piece = content.lowerBound, i = content.lowerBound
+        while i < content.upperBound {
+            if row[i] == quote, i + 1 < content.upperBound, row[i + 1] == quote {
+                s += decode(row[piece...i])
+                i += 2
+                piece = i
+            } else {
+                i += 1
+            }
         }
-        return String(decoding: bytes, as: UTF8.self)
+        return s + decode(row[piece..<content.upperBound])
     }
 }

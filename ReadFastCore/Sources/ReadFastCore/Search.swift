@@ -35,6 +35,10 @@ extension CSVFile {
     /// complete step with no matches. `caseSensitive: false` folds ASCII only:
     /// `é` doesn't match `É`. Doesn't need `indexAll`: the search counts rows
     /// itself, so matches can be in rows `row(_:)` can't serve yet.
+    ///
+    /// Byte-based: works for UTF-8 and Windows-1252 (ASCII queries) files. For
+    /// UTF-16 files `supportsSearch` is false and a search finishes at once with
+    /// no matches; disable the search field for them.
     public func search(_ query: String, caseSensitive: Bool = false) -> AsyncStream<SearchProgress> {
         search(query, caseSensitive: caseSensitive, threads: ProcessInfo.processInfo.activeProcessorCount)
     }
@@ -50,7 +54,7 @@ extension CSVFile {
             DispatchQueue.global(qos: .userInitiated).async {
                 var s = Searcher(file: self, query: query, fold: !caseSensitive)
                 let n = self.data.count
-                var done = s.query.isEmpty ? n : 0
+                var done = s.query.isEmpty || !self.supportsSearch ? n : 0
                 repeat {
                     if stopped.flag.load(ordering: .relaxed) { break }
                     let to = min(n, done + segmentBytes)
@@ -129,10 +133,15 @@ private struct Searcher {
         }
         let rowEnd = end == d.count || d[end] == UInt8(ascii: "\n")
         if rowEnd, end > cell, d[end - 1] == UInt8(ascii: "\r") { end -= 1 } // as rowRange trims it
-        let text = Fields.split(UnsafeRawBufferPointer(rebasing: d[cell..<end]), delimiter: file.delimiter)[0]
+        let text = Fields.split(UnsafeRawBufferPointer(rebasing: d[cell..<end]), delimiter: file.delimiter, encoding: file.encoding)[0]
         let shown = fold ? text.utf8.map(lowerASCII) : Array(text.utf8)
         return shown.firstRange(of: query) != nil
     }
 }
 
 private func lowerASCII(_ c: UInt8) -> UInt8 { c >= 65 && c <= 90 ? c | 0x20 : c }
+
+extension CSVFile {
+    /// Whether `search` works for this file's encoding (not for UTF-16 yet).
+    public var supportsSearch: Bool { encoding.unitWidth == 1 }
+}
