@@ -22,7 +22,8 @@ import ReadFastCore
 
 ```swift
 public final class CSVFile: Sendable {
-    public static func open(_ url: URL, previewBytes: Int = defaultPreviewBytes) throws -> CSVFile
+    public static func open(_ url: URL, encoding: CSVEncoding? = nil, // nil = detect
+                            previewBytes: Int = defaultPreviewBytes) throws -> CSVFile
 
     public func row(_ i: Int) -> [String]?   // fields of row i; nil = past the end OR not indexed yet
     public var availableRows: Int            // rows row(_:) can return right now
@@ -33,6 +34,7 @@ public final class CSVFile: Sendable {
     public func indexAll(onProgress: @escaping @Sendable (Double) -> Void = { _ in }) async
 
     public let delimiter: UInt8              // sniffed from row 0: , ; \t |
+    public let encoding: CSVEncoding         // detected at open unless given
     public let byteCount: Int                // file size
 
     public static let defaultPreviewBytes: Int   // 512 KB
@@ -43,6 +45,10 @@ public enum RowCount: Equatable, Sendable {
     case exact(Int), estimated(Int)
     public var value: Int
 }
+
+public enum CSVEncoding: String, Sendable, CaseIterable {
+    case utf8, utf16LE, utf16BE, windows1252
+}
 ```
 
 ### Semantics to get right
@@ -50,7 +56,8 @@ public enum RowCount: Equatable, Sendable {
 | Thing | Rule |
 |---|---|
 | Row numbering | Row 0 is the first line of the file (normally the header). Data row `i` is `row(i + 1)`; data row count is `rowCount.value - 1`. |
-| Fields | Already split and unquoted: `"Smith, J"` → `Smith, J`, `""` → `"`. Quoted newlines stay inside the field. Trailing `\r` is stripped. A UTF-8 BOM is skipped. Invalid UTF-8 becomes `�`. |
+| Fields | Already split and unquoted: `"Smith, J"` → `Smith, J`, `""` → `"`. Quoted newlines stay inside the field. Trailing `\r` is stripped. A BOM is skipped. Invalid UTF-8 becomes `�`. |
+| Encoding | Detected from the first `previewBytes`: UTF-8 / UTF-16 LE / UTF-16 BE BOM, then BOM-less UTF-16 (zero bytes on one side of most units), then valid UTF-8, else Windows-1252. Offer a menu that reopens with `open(url, encoding:)`: a file that is ASCII in the sample but 1252 later is read as UTF-8 (`�`), and BOM-less UTF-16 with no Latin text (e.g. all CJK) isn't detected. UTF-16 is scanned in place as 16-bit units (same NEON masks, 64 units per mask), never transcoded. |
 | Ragged rows | Rows can have more or fewer fields than the header. Pad/ignore in the UI; never index blindly. |
 | `row(i) == nil` | Either `i >= rowCount` or the index hasn't reached row `i` yet. Check `i < availableRows` to tell them apart; show a placeholder row while indexing. |
 | Row count | `.estimated` is projected from the bytes scanned so far and improves after each segment; it can move, so the scroll height may change slightly until `.exact`. |
@@ -170,7 +177,7 @@ from other sources (launcher recents, drag and drop).
 
 ```sh
 cd ReadFastCore
-swift test                                   # 27 tests, ~3 s
+swift test                                   # 34 tests, ~3 s
 RF_BENCH=1 swift test -c release --filter benchmark   # open / index GB/s on a 1 GB file
 ```
 
@@ -187,6 +194,7 @@ Sources/ReadFastCore/
   CSVFile.swift           public API: mmap, preview, progressive indexAll
   RowIndex.swift          sparse index: newlines per 64 KB block, row lookup = binary search + 1 block scan
   Fields.swift            row → fields, delimiter sniffing (scalar; only runs on visible rows)
+  Encoding.swift          CSVEncoding: detection, Windows-1252 table
 ```
 
 Known limits: Intel Macs / x86 simulators use a slower scalar path; a file

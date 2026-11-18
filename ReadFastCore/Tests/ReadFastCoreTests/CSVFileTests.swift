@@ -133,5 +133,21 @@ struct CSVFileTests {
         t = clock.now
         for i in stride(from: 0, to: f.availableRows, by: max(1, f.availableRows / 1000)) { _ = f.row(i) }
         print("1000 preview rows: \(clock.now - t)")
+
+        // the same rows as ~1 GB of UTF-16 LE
+        let wide = Data(utf16(String(decoding: chunk, as: UTF8.self), bigEndian: false, bom: true))
+        let url16 = FileManager.default.temporaryDirectory.appendingPathComponent("rf-bench-16.csv")
+        FileManager.default.createFile(atPath: url16.path, contents: nil)
+        let h16 = try FileHandle(forWritingTo: url16)
+        for _ in 0..<64 { try h16.write(contentsOf: wide) }
+        try h16.close()
+        defer { try? FileManager.default.removeItem(at: url16) }
+        for threads in [1, ProcessInfo.processInfo.activeProcessorCount] {
+            let g = try CSVFile.open(url16)
+            t = clock.now
+            await g.indexAll(threads: threads)
+            let s = Double((clock.now - t).components.attoseconds) / 1e18 + Double((clock.now - t).components.seconds)
+            print("utf16 index \(threads) threads: \(String(format: "%.2f", Double(g.byteCount) / s / 1e9)) GB/s, \(g.rowCount), \(g.encoding)")
+        }
     }
 }

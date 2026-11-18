@@ -12,6 +12,8 @@ struct RowIndex: Sendable {
     let blockSize: Int
     let scanned: Int
     let total: Int
+    /// Code unit of the data; offsets stay in bytes.
+    let encoding: CSVEncoding
     /// cum[b] = row-ending newlines before block b; last element = all of them.
     let cum: [Int]
     let insideAt: [UInt8]
@@ -19,15 +21,17 @@ struct RowIndex: Sendable {
 
     var isComplete: Bool { scanned == total }
     var newlines: Int { cum[cum.count - 1] }
+    private var w: Int { encoding.unitWidth }
 
     /// Index the first `n` bytes, front to back in segments of `segmentBytes`
     /// (all cores inside each segment). After each segment `progress` gets the
     /// index so far: a valid partial index serving every row scanned yet.
     static func build(
-        _ data: UnsafeRawBufferPointer, upTo n: Int, blockSize: Int, threads: Int,
+        _ data: UnsafeRawBufferPointer, upTo n: Int, blockSize: Int, threads: Int, encoding: CSVEncoding = .utf8,
         segmentBytes: Int = .max, progress: (RowIndex) -> Void = { _ in }
     ) -> RowIndex {
-        precondition(blockSize > 0 && blockSize % 64 == 0, "blockSize must be a multiple of 64")
+        precondition(blockSize > 0 && blockSize % (64 * encoding.unitWidth) == 0, "blockSize must be a multiple of 64 units")
+        precondition(n % encoding.unitWidth == 0 && data.count % encoding.unitWidth == 0)
         precondition(n <= data.count)
         let segment = max(blockSize, segmentBytes / blockSize * blockSize) // whole blocks
         var cum = [0]
@@ -44,14 +48,14 @@ struct RowIndex: Sendable {
             if len > 0 {
                 inside = counts.withUnsafeMutableBufferPointer { c in
                     segInside.withUnsafeMutableBufferPointer { i in
-                        rf_index(bytes(data) + done, len, blockSize, threads, inside, c.baseAddress!, i.baseAddress!)
+                        rf_index_units(bytes(data) + done, len, blockSize, threads, inside, c.baseAddress!, i.baseAddress!, encoding.scanUnit)
                     }
                 }
             }
             for c in counts { cum.append(cum[cum.count - 1] + Int(c)) }
             insideAt += segInside
             done += len
-            let idx = RowIndex(blockSize: blockSize, scanned: done, total: data.count, cum: cum, insideAt: insideAt, endsInside: inside)
+            let idx = RowIndex(blockSize: blockSize, scanned: done, total: data.count, encoding: encoding, cum: cum, insideAt: insideAt, endsInside: inside)
             progress(idx)
             if done == n { return idx }
         }
@@ -64,7 +68,7 @@ struct RowIndex: Sendable {
     /// quotes ends the last row; it doesn't start another one.
     func exactRowCount(_ data: UnsafeRawBufferPointer) -> Int {
         guard total > 0 else { return 0 }
-        let trailing = data[total - 1] == UInt8(ascii: "\n") && !endsInside
+        let trailing = encoding.unit(data, at: total - w, is: UInt8(ascii: "\n")) && !endsInside
         return newlines + 1 - (trailing ? 1 : 0)
     }
 
@@ -84,9 +88,9 @@ struct RowIndex: Sendable {
     /// Byte range of row `r` without its '\n' (and a trailing '\r').
     func rowRange(_ r: Int, _ data: UnsafeRawBufferPointer) -> Range<Int>? {
         guard r >= 0, r < availableRows(data) else { return nil }
-        let start = r == 0 ? 0 : newlineOffset(r, data) + 1
+        let start = r == 0 ? 0 : newlineOffset(r, data) + w
         var end = r + 1 <= newlines ? newlineOffset(r + 1, data) : total
-        if end > start, data[end - 1] == UInt8(ascii: "\r") { end -= 1 }
+        if end > start, encoding.unit(data, at: end - w, is: UInt8(ascii: "\r")) { end -= w }
         return start..<end
     }
 
@@ -100,7 +104,7 @@ struct RowIndex: Sendable {
         }
         let b = lo - 1
         let start = b * blockSize
-        let off = rf_find_newline(bytes(data) + start, min(blockSize, scanned - start), insideAt[b] != 0, UInt64(k - cum[b]))
+        let off = rf_find_newline_units(bytes(data) + start, min(blockSize, scanned - start), insideAt[b] != 0, UInt64(k - cum[b]), encoding.scanUnit)
         precondition(off >= 0, "index out of sync with data")
         return start + Int(off)
     }
