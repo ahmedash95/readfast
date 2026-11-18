@@ -23,7 +23,11 @@ struct FieldsTests {
 
     @Test func messyInputDoesNotCrash() {
         #expect(split("a,\"b,c") == ["a", "\"b,c"]) // unterminated quote: rest is one field
-        #expect(split("5\" pipe,x") == ["5\" pipe,x"]) // stray quote opens a quote
+        #expect(split("5\" pipe,x") == ["5\" pipe", "x"]) // a quote mid-field is plain
+        #expect(split("a\"b\"\"c,x") == ["a\"b\"\"c", "x"])
+        #expect(split("\"ab\"cd,x") == ["abcd", "x"]) // text after the closing quote is kept
+        #expect(split("\"a\"\"\",\"\"\"\"\"\"") == ["a\"", "\"\""])
+        #expect(split("x, \"y\",z") == ["x", " \"y\"", "z"]) // a space first: not quoted
         #expect(split("\"") == ["\""])
         #expect(split("caf\u{e9},\u{1F600}") == ["caf\u{e9}", "\u{1F600}"])
     }

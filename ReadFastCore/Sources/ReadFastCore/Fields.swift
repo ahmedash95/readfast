@@ -5,33 +5,48 @@ enum Fields {
 
     /// Fields of `row`, outer quotes removed and "" turned into ".
     /// An empty row is one empty field; "a," is two fields.
+    /// Same quote rule as the scan (readfast.h): a quote opens a quoted field
+    /// only as a field's first byte; anywhere else it's a plain byte.
     static func split(_ row: UnsafeRawBufferPointer, delimiter: UInt8) -> [String] {
         var out: [String] = []
-        var start = 0, quotes = 0, inside = false
+        var start = 0, quoted = false, inside = false, closed = false
         for i in 0...row.count {
             if i < row.count {
                 let c = row[i]
-                if c == quote { inside.toggle(); quotes += 1; continue }
+                let afterClose = closed
+                closed = false
+                if c == quote, i == start || inside || afterClose {
+                    // opens, closes, or (right after a close) is the 2nd half of ""
+                    quoted = true
+                    closed = inside
+                    inside.toggle()
+                    continue
+                }
                 if c != delimiter || inside { continue }
             }
-            out.append(field(UnsafeRawBufferPointer(rebasing: row[start..<i]), quotes: quotes))
+            let raw = UnsafeRawBufferPointer(rebasing: row[start..<i])
+            out.append(quoted && !inside ? unquote(raw) : String(decoding: raw, as: UTF8.self))
             start = i + 1
-            quotes = 0
+            quoted = false
         }
         return out
     }
 
-    private static func field(_ raw: UnsafeRawBufferPointer, quotes: Int) -> String {
-        let quoted = raw.count >= 2 && raw[0] == quote && raw[raw.count - 1] == quote
-        guard quoted else { return String(decoding: raw, as: UTF8.self) }
-        let content = UnsafeRawBufferPointer(rebasing: raw[1..<(raw.count - 1)])
-        guard quotes > 2 else { return String(decoding: content, as: UTF8.self) }
+    /// `"a ""b"" c"rest` → `a "b" crest`. Only called on closed quoted fields.
+    private static func unquote(_ raw: UnsafeRawBufferPointer) -> String {
+        if raw[1...].firstIndex(of: quote) == raw.count - 1 { // "plain": no escapes, nothing after
+            return String(decoding: UnsafeRawBufferPointer(rebasing: raw[1..<(raw.count - 1)]), as: UTF8.self)
+        }
         var bytes: [UInt8] = []
-        bytes.reserveCapacity(content.count)
-        var i = 0
-        while i < content.count {
-            bytes.append(content[i])
-            if content[i] == quote, i + 1 < content.count, content[i + 1] == quote { i += 1 }
+        bytes.reserveCapacity(raw.count)
+        var i = 1
+        while i < raw.count {
+            if raw[i] == quote {
+                if i + 1 < raw.count, raw[i + 1] == quote { bytes.append(quote); i += 2; continue }
+                bytes += raw[(i + 1)...] // the closing quote; the rest is plain
+                break
+            }
+            bytes.append(raw[i])
             i += 1
         }
         return String(decoding: bytes, as: UTF8.self)

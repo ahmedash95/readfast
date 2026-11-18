@@ -51,6 +51,8 @@ public enum RowCount: Equatable, Sendable {
 |---|---|
 | Row numbering | Row 0 is the first line of the file (normally the header). Data row `i` is `row(i + 1)`; data row count is `rowCount.value - 1`. |
 | Fields | Already split and unquoted: `"Smith, J"` → `Smith, J`, `""` → `"`. Quoted newlines stay inside the field. Trailing `\r` is stripped. A UTF-8 BOM is skipped. Invalid UTF-8 becomes `�`. |
+| Quotes | RFC 4180, lenient. A `"` opens a quoted field only as the field's **first byte** (start of row or right after the delimiter). Inside, `""` is a literal `"` and a single `"` closes the field; any text after the closing quote up to the next delimiter is kept as is (`"ab"cd` → `abcd`). A `"` anywhere else is an ordinary character: `12,5" pipe,ok` → `12`, `5" pipe`, `ok`, and the rows after it are unaffected. A quote that opens at a field start and never closes still runs to the end of the file (shown cut at `maxRowBytes`, raw, with its quote). `, "x"` (space first) is not quoted. |
+| Line endings | `\n` and `\r\n` (mixed is fine). Files whose first 512 KB contain `\r` but no row-ending `\n` are read as classic Mac files: `\r` ends rows, `\n` is an ordinary character. |
 | Ragged rows | Rows can have more or fewer fields than the header. Pad/ignore in the UI; never index blindly. |
 | `row(i) == nil` | Either `i >= rowCount` or the index hasn't reached row `i` yet. Check `i < availableRows` to tell them apart; show a placeholder row while indexing. |
 | Row count | `.estimated` is projected from the bytes scanned so far and improves after each segment; it can move, so the scroll height may change slightly until `.exact`. |
@@ -170,19 +172,29 @@ from other sources (launcher recents, drag and drop).
 
 ```sh
 cd ReadFastCore
-swift test                                   # 27 tests, ~3 s
+swift test                                   # 33 tests, ~4 s
 RF_BENCH=1 swift test -c release --filter benchmark   # open / index GB/s on a 1 GB file
 ```
 
 Tests use tiny block and segment sizes, so 2 KB inputs exercise the same paths as
 a 10 GB file: SIMD primitives vs scalar, quotes split across threads and
 segments, preview → progressive → exact index, a 4 GB sparse file opening in
-< 200 ms without being read, and runaway (unclosed-quote) rows.
+< 200 ms without being read, runaway (unclosed-quote) rows, stray quotes at
+every offset around block/chunk/segment boundaries, CR-only and mixed CRLF files.
+Everything is fuzzed against `Oracle` (Tests/…/Support.swift), the quote rule
+written as a plain byte-by-byte state machine.
+
+How the scan applies the quote rule in parallel: per 64 bytes it assumes every
+quote toggles (prefix XOR), then drops quote runs that start after an ordinary
+byte outside quotes (rare: one extra round per stray quote). The state between
+bytes is one of field start / unquoted / quoted (`RF_*` in `readfast.h`), so
+each thread guesses its chunk's start state from the byte before it, and a
+serial pass rescans blocks only where the guess was wrong, until it converges.
 
 ## Layout (for changing the engine, not for using it)
 
 ```
-Sources/CReadFast/        C + NEON: 64-byte masks, prefix-XOR quote tracking, parallel block index
+Sources/CReadFast/        C + NEON: 64-byte masks, quote-rule state machine, speculative parallel block index
 Sources/ReadFastCore/
   CSVFile.swift           public API: mmap, preview, progressive indexAll
   RowIndex.swift          sparse index: newlines per 64 KB block, row lookup = binary search + 1 block scan
@@ -190,4 +202,6 @@ Sources/ReadFastCore/
 ```
 
 Known limits: Intel Macs / x86 simulators use a slower scalar path; a file
-truncated by another process while open crashes on read (SIGBUS).
+truncated by another process while open crashes on read (SIGBUS). After an
+unclosed quote, the rest of the file is indexed at one-core speed (the
+parallel guesses are all wrong); it's still one row.

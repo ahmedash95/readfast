@@ -39,6 +39,7 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
     private let region: UnsafeMutableRawPointer?
     private let data: UnsafeRawBufferPointer // the mapped bytes after a UTF-8 BOM
     private let blockSize: Int
+    private let newline: UInt8
     private let index: Mutex<RowIndex>
 
     public static func open(_ url: URL, previewBytes: Int = defaultPreviewBytes) throws -> CSVFile {
@@ -69,12 +70,22 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
         byteCount = len
         self.blockSize = blockSize
 
+        // The scan needs the delimiter (a quote only opens a field at a field
+        // start), so sniff it from the first line before indexing.
+        // ponytail: a quoted line break in the header cuts the sniffed line short.
+        let head = data[..<min(data.count, 64 << 10)]
+        let firstLine = head.firstIndex { $0 == UInt8(ascii: "\n") || $0 == UInt8(ascii: "\r") } ?? head.endIndex
+        let delimiter = Fields.sniffDelimiter(UnsafeRawBufferPointer(rebasing: data[..<firstLine]))
+        self.delimiter = delimiter
+
         // Preview: index only the first `previewBytes` (whole blocks), serially.
         let preview = min(data.count, max(blockSize, previewBytes / blockSize * blockSize))
-        let idx = RowIndex.build(data, upTo: preview, blockSize: blockSize, threads: 1)
-        let first = idx.rowRange(0, data).map { UnsafeRawBufferPointer(rebasing: data[$0]) }
-            ?? UnsafeRawBufferPointer(rebasing: data[..<min(data.count, 64 << 10)])
-        delimiter = Fields.sniffDelimiter(first)
+        var idx = RowIndex.build(data, upTo: preview, blockSize: blockSize, threads: 1, delimiter: delimiter)
+        // Classic Mac line endings: '\r' but no row-ending '\n' in the preview.
+        if idx.newlines == 0, data[..<preview].contains(UInt8(ascii: "\r")) {
+            idx = RowIndex.build(data, upTo: preview, blockSize: blockSize, threads: 1, delimiter: delimiter, newline: UInt8(ascii: "\r"))
+        }
+        newline = idx.newline
         index = Mutex(idx)
     }
 
@@ -121,7 +132,8 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
         if isIndexed { return }
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
-                _ = RowIndex.build(self.data, upTo: self.data.count, blockSize: self.blockSize, threads: threads, segmentBytes: segmentBytes) { partial in
+                _ = RowIndex.build(self.data, upTo: self.data.count, blockSize: self.blockSize, threads: threads,
+                                     delimiter: self.delimiter, newline: self.newline, segmentBytes: segmentBytes) { partial in
                     // never step back, e.g. behind a bigger preview or a concurrent call
                     self.index.withLock { if partial.scanned > $0.scanned { $0 = partial } }
                     onProgress(partial.fraction)
