@@ -1,0 +1,140 @@
+# Release: every push to main builds ReadFast.app → DMG, publishes it as GitHub
+# release v<MARKETING_VERSION>.<patch> and writes Casks/readfast.rb in
+# ahmedash95/homebrew-tap. Patch = highest existing v<MARKETING_VERSION>.N tag + 1
+# (starting at .0). Bump MARKETING_VERSION in the project to move major/minor.
+#
+# Repo secret HOMEBREW_TAP_TOKEN: fine-grained PAT with Contents read/write on
+# ahmedash95/homebrew-tap. Without it the release is still published and the
+# tap step is skipped.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false # queue, never kill a release half-way
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: xcode-27 # Xcode 27 image (macOS 27, arm64); the app targets macOS 27
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Version
+        run: |
+          base="$(sed -n 's/.*"MARKETING_VERSION": "\(.*\)".*/\1/p' ReadFast.xcodeproj/project.xcproj | head -1)"
+          tags="$(git ls-remote --tags origin "refs/tags/v$base.*")"
+          # Re-run of a released commit keeps its version; otherwise next patch (first is .0).
+          version="$(awk -v s="$GITHUB_SHA" '$1==s {sub("refs/tags/v","",$2); print $2; exit}' <<<"$tags")"
+          if [[ -z "$version" ]]; then
+            last="$(sed -n "s|.*refs/tags/v$base\.\([0-9]*\)$|\1|p" <<<"$tags" | sort -n | tail -1)"
+            version="$base.$(( ${last:--1} + 1 ))"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.2.app
+          # Ad-hoc signed, not notarized (same as rapidsnap/toma).
+          xcodebuild -project ReadFast.xcodeproj -scheme ReadFast -configuration Release \
+            -destination 'generic/platform=macOS' -derivedDataPath build ARCHS=arm64 \
+            CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            build | tail -20
+          test -d build/Build/Products/Release/ReadFast.app
+
+      - name: Make DMG
+        run: |
+          mkdir dmg
+          cp -R build/Build/Products/Release/ReadFast.app dmg/
+          ln -s /Applications dmg/Applications
+          # hdiutil on hosted runners is occasionally "Resource busy"; retry.
+          for attempt in 1 2 3; do
+            hdiutil create -volname ReadFast -srcfolder dmg -format UDZO -ov "ReadFast-$VERSION.dmg" && ok=1 && break
+            echo "hdiutil failed (attempt $attempt), retrying"; sleep 10
+          done
+          [[ -n "${ok:-}" ]]
+          shasum -a 256 "ReadFast-$VERSION.dmg" > "ReadFast-$VERSION.dmg.sha256"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          files=("ReadFast-$VERSION.dmg" "ReadFast-$VERSION.dmg.sha256")
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" "${files[@]}" --clobber   # re-run
+          else
+            gh release create "v$VERSION" "${files[@]}" --target "$GITHUB_SHA" \
+              --title "ReadFast $VERSION" --generate-notes
+          fi
+
+      - name: Check tap token
+        id: tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [[ -n "$TAP_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::HOMEBREW_TAP_TOKEN not set; update the cask in ahmedash95/homebrew-tap by hand"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.tap.outputs.enabled == 'true'
+        with:
+          repository: ahmedash95/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Write cask
+        if: steps.tap.outputs.enabled == 'true'
+        working-directory: homebrew-tap
+        run: |
+          sha="$(cut -d' ' -f1 "../ReadFast-$VERSION.dmg.sha256")"
+          cat > Casks/readfast.rb <<EOF
+          cask "readfast" do
+            version "$VERSION"
+            sha256 "$sha"
+
+            url "https://github.com/ahmedash95/ReadFast/releases/download/v#{version}/ReadFast-#{version}.dmg"
+            name "ReadFast"
+            desc "Fast CSV viewer for macOS"
+            homepage "https://github.com/ahmedash95/ReadFast"
+
+            depends_on arch: :arm64
+            depends_on macos: ">= :golden_gate"
+
+            app "ReadFast.app"
+
+            # Ad-hoc signed but not notarized, so strip quarantine or Gatekeeper refuses it.
+            postflight do
+              system_command "/usr/bin/xattr",
+                             args:         ["-dr", "com.apple.quarantine", "#{appdir}/ReadFast.app"],
+                             must_succeed: false
+            end
+
+            uninstall quit: "dev.ahmedash.readfast"
+          end
+          EOF
+          git add Casks/readfast.rb
+          if git diff --cached --quiet; then echo "cask already at $VERSION"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "readfast $VERSION"
+          git push

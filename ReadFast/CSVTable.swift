@@ -1,72 +1,59 @@
 import Foundation
+import Observation
+import ReadFastCore
 
-/// Stand-in for the SIMD engine. The UI only needs this surface: `load`, `header`, `rowCount`, `fields(at:)`.
-/// ponytail: serial byte loop + full row index; the engine's SIMD scan + sparse 1/1024 index replaces it.
-nonisolated final class CSVTable: Sendable {
+/// The UI's view of one CSV file, backed by the ReadFastCore engine (see ReadFastCore/README.md).
+///
+/// `load` returns after mapping the file and indexing a 512 KB preview, so the header and first
+/// rows show at once. `index()` then indexes the rest on every core, front to back: `rowCount`
+/// grows from an estimate to the exact count and `progress` goes 0 → 1.
+@MainActor @Observable
+final class CSVTable {
     let header: [String]
-    let rowCount: Int
-    var byteCount: Int { data.count }
-    private let data: Data
-    private let rowStarts: [Int]   // rowStarts[0] is the header
+    /// File size in bytes.
+    let byteCount: Int
+    /// Data rows (header excluded). Estimated until `isExact`.
+    private(set) var rowCount = 0
+    private(set) var isExact = false
+    /// Share of the file indexed, 0...1.
+    private(set) var progress = 0.0
 
-    @concurrent static func load(_ url: URL) async throws -> CSVTable {
-        try CSVTable(url: url)
+    @ObservationIgnored private let file: CSVFile
+
+    static func load(_ url: URL) async throws -> CSVTable {
+        CSVTable(file: try await open(url))
     }
 
-    init(url: URL) throws {
-        let data = try Data(contentsOf: url, options: .alwaysMapped)
-        var starts: [Int] = data.isEmpty ? [] : [0]
-        data.withUnsafeBytes { bytes in
-            var inQuotes = false
-            for i in bytes.indices {
-                switch bytes[i] {
-                case UInt8(ascii: "\""): inQuotes.toggle()
-                case UInt8(ascii: "\n") where !inQuotes && i + 1 < bytes.count: starts.append(i + 1)
-                default: break
-                }
-            }
+    @concurrent nonisolated private static func open(_ url: URL) async throws -> CSVFile {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        return try CSVFile.open(url) // the mapping stays valid after access stops
+    }
+
+    private init(file: CSVFile) {
+        self.file = file
+        header = file.row(0) ?? []
+        byteCount = file.byteCount
+        refresh()
+    }
+
+    /// Index the whole file in the background. Returns once the row count is exact.
+    func index() async {
+        await file.indexAll { _ in
+            Task { @MainActor [weak self] in self?.refresh() }
         }
-        self.data = data
-        self.rowStarts = starts
-        self.rowCount = max(starts.count - 1, 0)
-        self.header = starts.isEmpty ? [] : Self.parse(data, from: 0, to: starts.count > 1 ? starts[1] : data.count)
+        refresh()
     }
 
-    /// Fields of data row `row` (0-based, header excluded).
+    /// Fields of data row `row` (0-based, header excluded). Empty while that row isn't indexed
+    /// yet; a real row always has at least one field.
     func fields(at row: Int) -> [String] {
-        let i = row + 1
-        return Self.parse(data, from: rowStarts[i], to: i + 1 < rowStarts.count ? rowStarts[i + 1] : data.count)
+        file.row(row + 1) ?? []
     }
 
-    private static func parse(_ data: Data, from start: Int, to end: Int) -> [String] {
-        data.withUnsafeBytes { all in
-            var line = all[start..<end]
-            while let last = line.last, last == UInt8(ascii: "\n") || last == UInt8(ascii: "\r") { line = line.dropLast() }
-
-            var fields: [String] = []
-            var field: [UInt8] = []
-            var inQuotes = false
-            var i = line.startIndex
-            while i < line.endIndex {
-                let b = line[i]
-                if inQuotes {
-                    if b == UInt8(ascii: "\"") {
-                        if i + 1 < line.endIndex, line[i + 1] == UInt8(ascii: "\"") { field.append(b); i += 1 } else { inQuotes = false }
-                    } else {
-                        field.append(b)
-                    }
-                } else if b == UInt8(ascii: "\"") {
-                    inQuotes = true
-                } else if b == UInt8(ascii: ",") {
-                    fields.append(String(decoding: field, as: UTF8.self))
-                    field.removeAll(keepingCapacity: true)
-                } else {
-                    field.append(b)
-                }
-                i += 1
-            }
-            fields.append(String(decoding: field, as: UTF8.self))
-            return fields
-        }
+    private func refresh() {
+        rowCount = max(0, file.rowCount.value - 1)
+        isExact = file.isIndexed
+        progress = file.indexedFraction
     }
 }

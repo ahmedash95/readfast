@@ -14,7 +14,11 @@ import SwiftUI
         DocumentGroup(viewing: CSVDocument.self) { file in
             CSVDocumentView(url: file.fileURL)
         }
-        .commands { ZoomCommands() }
+        .defaultSize(width: 1100, height: 720)   // first launch only; after that the last frame is reused
+        .commands {
+            ZoomCommands()
+            GoToRowCommands()
+        }
 
         Settings {
             SettingsView()
@@ -39,7 +43,24 @@ struct ZoomCommands: Commands {
     }
 }
 
+struct GoToRowCommands: Commands {
+    @FocusedBinding(\.showGoToRow) private var showGoToRow
+
+    var body: some Commands {
+        CommandMenu("Navigate") {
+            Button("Go to Row…") { showGoToRow = true }
+                .keyboardShortcut("l")
+                .disabled(showGoToRow == nil)
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // After the first windows are up, so the prompt isn't the first thing drawn.
+        DispatchQueue.main.async { DefaultCSVApp.askOnce() }
+    }
+
     // The launcher replaces the open panel a viewer-only DocumentGroup shows at launch.
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { false }
 
