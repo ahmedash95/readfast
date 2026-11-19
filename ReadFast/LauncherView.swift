@@ -20,7 +20,7 @@ struct LauncherView: View {
                     Text("Open a CSV file to get started.")
                 } actions: {
                     Button("Open…", action: showOpenPanel)
-                        .buttonStyle(.glassProminent)
+                        .modifier(GlassButton(prominent: true))
                 }
             } else if layout == .grid {
                 grid
@@ -65,7 +65,7 @@ struct LauncherView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
                     }
-                    .buttonStyle(.glass)
+                    .modifier(GlassButton())
                     .buttonBorderShape(.roundedRectangle(radius: 18))
                     .help(url.path(percentEncoded: false))
                 }
@@ -109,4 +109,17 @@ struct LauncherView: View {
 
 #Preview {
     LauncherView()
+}
+
+/// Liquid Glass button styles on macOS 26+, the closest bordered style on macOS 15.
+private struct GlassButton: ViewModifier {
+    var prominent = false
+
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            if prominent { content.buttonStyle(.glassProminent) } else { content.buttonStyle(.glass) }
+        } else {
+            if prominent { content.buttonStyle(.borderedProminent) } else { content.buttonStyle(.bordered) }
+        }
+    }
 }
