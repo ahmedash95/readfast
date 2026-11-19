@@ -1,5 +1,9 @@
 import CReadFast
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Dispatch
 import Foundation
 import Synchronization
@@ -57,7 +61,11 @@ public final class CSVFile: @unchecked Sendable { // bytes are read-only; the in
 
     init(url: URL, previewBytes: Int, blockSize: Int, encoding: CSVEncoding? = nil,
          delimiter forcedDelimiter: UInt8? = nil, hasHeader forcedHeader: Bool? = nil) throws {
+        #if canImport(Darwin)
         let fd = Darwin.open(url.path, O_RDONLY)
+        #else
+        let fd = Glibc.open(url.path, O_RDONLY)
+        #endif
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         defer { close(fd) } // the mapping outlives the descriptor
         var st = stat()

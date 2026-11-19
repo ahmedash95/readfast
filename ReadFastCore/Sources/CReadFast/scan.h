@@ -2,6 +2,35 @@
 // search. Private: static inline so both translation units get it inlined.
 #pragma once
 #include "readfast.h"
+
+// Runs fn(ctx, 0..<n) on n threads and waits: libdispatch on Apple, pthreads
+// elsewhere (Linux toolchains don't put dispatch.h on the C include path).
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+static inline void rf_parallel(size_t n, void *ctx, void (*fn)(void *, size_t)) {
+    dispatch_apply_f(n, DISPATCH_APPLY_AUTO, ctx, fn);
+}
+#else
+#include <pthread.h>
+#include <stdlib.h>
+typedef struct { void *ctx; void (*fn)(void *, size_t); size_t i; pthread_t id; bool started; } rf_job;
+static void *rf_job_run(void *p) {
+    rf_job *j = p;
+    j->fn(j->ctx, j->i);
+    return NULL;
+}
+static inline void rf_parallel(size_t n, void *ctx, void (*fn)(void *, size_t)) {
+    rf_job *jobs = n > 1 ? calloc(n, sizeof(rf_job)) : NULL;
+    for (size_t i = 1; i < n; i++) {
+        jobs[i] = (rf_job){.ctx = ctx, .fn = fn, .i = i};
+        jobs[i].started = pthread_create(&jobs[i].id, NULL, rf_job_run, &jobs[i]) == 0;
+        if (!jobs[i].started) fn(ctx, i); // no thread available: run it here
+    }
+    if (n > 0) fn(ctx, 0);
+    for (size_t i = 1; i < n; i++) if (jobs[i].started) pthread_join(jobs[i].id, NULL);
+    free(jobs);
+}
+#endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif

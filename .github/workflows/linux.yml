@@ -1,0 +1,110 @@
+# Linux: ReadFastCore tests and the GTK app (ReadFastLinux/) on x86_64 (scalar scan path)
+# and aarch64 (NEON). Builds per arch a .deb and a tarball (mirrors a prefix:
+# `tar -xzf readfast-linux-x86_64.tar.gz -C ~/.local`). Needs GTK 4.10+ at runtime
+# (Ubuntu 24.04+: libgtk-4-1, which apt pulls in for the .deb); Swift is linked in statically.
+#
+# Every push to main replaces the assets of the `linux-latest` prerelease, so the install
+# command stays the same (Ubuntu 24.04+; arm64: readfast_arm64.deb):
+#   wget https://github.com/ahmedash95/readfast/releases/download/linux-latest/readfast_amd64.deb
+#   sudo apt install ./readfast_amd64.deb
+name: Linux
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test and build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    container: swift:6.4.2-noble
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Core tests
+        working-directory: ReadFastCore
+        run: swift test
+
+      - name: Install GTK 4
+        run: apt-get update -qq && apt-get install -y -qq libgtk-4-dev
+
+      - name: Build app
+        working-directory: ReadFastLinux
+        run: swift build -c release --static-swift-stdlib
+
+      - name: Package
+        run: |
+          mkdir -p dist/bin dist/share/applications dist/share/icons/hicolor/256x256/apps
+          install -m 755 -s ReadFastLinux/.build/release/readfast dist/bin/
+          cp ReadFastLinux/dev.ahmedash.readfast.desktop dist/share/applications/
+          cp ReadFast/Assets.xcassets/AppIcon.appiconset/icon_256x256@1x.png \
+             dist/share/icons/hicolor/256x256/apps/dev.ahmedash.readfast.png
+          tar -czf readfast-linux-${{ matrix.arch }}.tar.gz -C dist .
+
+      - name: Make .deb
+        run: |
+          arch=$([ "${{ matrix.arch }}" = x86_64 ] && echo amd64 || echo arm64)
+          base="$(sed -n 's/.*"MARKETING_VERSION": "\(.*\)".*/\1/p' ReadFast.xcodeproj/project.xcproj | head -1)"
+          mkdir -p deb/DEBIAN deb/usr
+          cp -R dist/. deb/usr/
+          cat > deb/DEBIAN/control <<EOF
+          Package: readfast
+          Version: $base.$GITHUB_RUN_NUMBER
+          Architecture: $arch
+          Maintainer: ReadFast <noreply@github.com>
+          Depends: libgtk-4-1 (>= 4.10)
+          Section: utils
+          Priority: optional
+          Homepage: https://github.com/ahmedash95/readfast
+          Description: Fast CSV viewer
+           Opens huge CSV files instantly and indexes them in the background.
+          EOF
+          dpkg-deb --root-owner-group --build deb "readfast_$arch.deb"
+          dpkg-deb --info "readfast_$arch.deb"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: readfast-linux-${{ matrix.arch }}
+          path: |
+            readfast-linux-${{ matrix.arch }}.tar.gz
+            readfast_*.deb
+
+  publish:
+    name: Publish linux-latest
+    needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          merge-multiple: true
+
+      - name: Upload to the linux-latest prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view linux-latest >/dev/null 2>&1; then
+            gh release create linux-latest --prerelease --target "$GITHUB_SHA" --title "ReadFast for Linux (latest)" \
+              --notes "Built from main on every push. Ubuntu 24.04+: download the .deb for your arch, then \`sudo apt install ./readfast_amd64.deb\`."
+          fi
+          gh release upload linux-latest readfast_*.deb readfast-linux-*.tar.gz --clobber

@@ -255,7 +255,8 @@ Sources/ReadFastCore/
   Encoding.swift          CSVEncoding: detection, Windows-1252 table
 ```
 
-Known limits: Intel Macs / x86 simulators use a slower scalar path; a file
+Known limits: Intel Macs / x86 simulators and x86_64 Linux use a slower scalar path
+(the package builds and tests on Linux too: threads are pthreads there instead of libdispatch); a file
 truncated by another process while open crashes on read (SIGBUS). Search
 matches raw bytes, so it also finds cells past the 1 MB `maxRowBytes` cut, and
 a query containing `�` doesn't match invalid UTF-8 shown as `�`. After an
