@@ -3,20 +3,29 @@
 # `tar -xzf readfast-linux-x86_64.tar.gz -C ~/.local`). Needs GTK 4.10+ at runtime
 # (Ubuntu 24.04+: libgtk-4-1, which apt pulls in for the .deb); Swift is linked in statically.
 #
-# Every push to main replaces the assets of the `linux-latest` prerelease, so the install
-# command stays the same (Ubuntu 24.04+; arm64: readfast_arm64.deb):
-#   wget https://github.com/ahmedash95/readfast/releases/download/linux-latest/readfast_amd64.deb
-#   sudo apt install ./readfast_amd64.deb
+# Pull requests: test and build only.
+# Releases: release.yml calls this with `version` after it creates v<version>; the Linux
+# assets are attached to that release and copied to the `linux-latest` prerelease, so both
+# of these stay valid (Ubuntu 24.04+; arm64: readfast_arm64.deb):
+#   https://github.com/ahmedash95/readfast/releases/latest/download/readfast_amd64.deb
+#   https://github.com/ahmedash95/readfast/releases/download/linux-latest/readfast_amd64.deb
+# Manual run with `version` set (e.g. 0.1.6) builds that tag and attaches to its release.
 name: Linux
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
   pull_request:
+  workflow_call:
+    inputs:
+      version:
+        description: Release version (no "v"); assets go to release v<version>
+        type: string
+        required: true
   workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release version to build and attach to (no "v"); empty = build only
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -37,6 +46,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.version && format('v{0}', inputs.version) || '' }}
 
       - name: Core tests
         working-directory: ReadFastCore
@@ -59,14 +69,20 @@ jobs:
           tar -czf readfast-linux-${{ matrix.arch }}.tar.gz -C dist .
 
       - name: Make .deb
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           arch=$([ "${{ matrix.arch }}" = x86_64 ] && echo amd64 || echo arm64)
-          base="$(sed -n 's/.*"MARKETING_VERSION": "\(.*\)".*/\1/p' ReadFast.xcodeproj/project.xcproj | head -1)"
+          version="$VERSION"
+          if [ -z "$version" ]; then
+            base="$(sed -n 's/.*"MARKETING_VERSION": "\(.*\)".*/\1/p' ReadFast.xcodeproj/project.xcproj | head -1)"
+            version="$base.$GITHUB_RUN_NUMBER"
+          fi
           mkdir -p deb/DEBIAN deb/usr
           cp -R dist/. deb/usr/
           cat > deb/DEBIAN/control <<EOF
           Package: readfast
-          Version: $base.$GITHUB_RUN_NUMBER
+          Version: $version
           Architecture: $arch
           Maintainer: ReadFast <noreply@github.com>
           Depends: libgtk-4-1 (>= 4.10)
@@ -87,9 +103,9 @@ jobs:
             readfast_*.deb
 
   publish:
-    name: Publish linux-latest
+    name: Attach to v${{ inputs.version }}
     needs: build
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: inputs.version != ''
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -98,13 +114,16 @@ jobs:
         with:
           merge-multiple: true
 
-      - name: Upload to the linux-latest prerelease
+      - name: Upload to the release and linux-latest
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
         run: |
+          files=(readfast_*.deb readfast-linux-*.tar.gz)
+          gh release upload "v$VERSION" "${files[@]}" --clobber
           if ! gh release view linux-latest >/dev/null 2>&1; then
             gh release create linux-latest --prerelease --target "$GITHUB_SHA" --title "ReadFast for Linux (latest)" \
-              --notes "Built from main on every push. Ubuntu 24.04+: download the .deb for your arch, then \`sudo apt install ./readfast_amd64.deb\`."
+              --notes "Same files as the latest vX.Y.Z release. Ubuntu 24.04+: download the .deb for your arch, then \`sudo apt install ./readfast_amd64.deb\`."
           fi
-          gh release upload linux-latest readfast_*.deb readfast-linux-*.tar.gz --clobber
+          gh release upload linux-latest "${files[@]}" --clobber

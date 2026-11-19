@@ -17,10 +17,10 @@ swift build -c release --static-swift-stdlib
 
 ## Install (Ubuntu 24.04+)
 
-`.github/workflows/linux.yml` publishes every push to main to the `linux-latest` prerelease:
+Every release (`.github/workflows/release.yml` → `linux.yml`) attaches the `.deb`s and tarballs:
 
 ```sh
-wget https://github.com/ahmedash95/readfast/releases/download/linux-latest/readfast_amd64.deb   # arm64: readfast_arm64.deb
+wget https://github.com/ahmedash95/readfast/releases/latest/download/readfast_amd64.deb   # arm64: readfast_arm64.deb
 sudo apt install ./readfast_amd64.deb   # pulls in libgtk-4-1; ReadFast shows up in the app grid
 ```
 
