@@ -27,7 +27,7 @@ concurrency:
 jobs:
   release:
     name: Build and release
-    runs-on: xcode-27 # Xcode 27 image (macOS 27, arm64); the app targets macOS 27
+    runs-on: xcode-27 # Xcode 27 image (macOS 27, arm64); the app targets macOS 15+
     timeout-minutes: 30
     permissions:
       contents: write
@@ -120,7 +120,7 @@ jobs:
             homepage "https://github.com/ahmedash95/readfast"
 
             depends_on arch: :arm64
-            depends_on macos: ">= :golden_gate"
+            depends_on macos: ">= :sequoia"
 
             app "ReadFast.app"
 
