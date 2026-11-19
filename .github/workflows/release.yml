@@ -1,6 +1,6 @@
 # Release: every push to main builds ReadFast.app → DMG, publishes it as GitHub
-# release v<MARKETING_VERSION>.<patch> and writes Casks/readfast.rb in
-# ahmedash95/homebrew-tap. Patch = highest existing v<MARKETING_VERSION>.N tag + 1
+# release v<MARKETING_VERSION>.<patch>, writes Casks/readfast.rb in
+# ahmedash95/homebrew-tap, then runs linux.yml to attach the Linux .debs and tarballs. Patch = highest existing v<MARKETING_VERSION>.N tag + 1
 # (starting at .0). Bump MARKETING_VERSION in the project to move major/minor.
 #
 # Repo secret HOMEBREW_TAP_DEPLOY_KEY: private half of a write deploy key on
@@ -14,8 +14,6 @@ on:
     paths-ignore:
       - "**.md"
       - "docs/**"
-      - "ReadFastLinux/**" # Linux-only changes: linux.yml
-      - ".github/workflows/linux.yml"
   workflow_dispatch:
 
 permissions: {}
@@ -27,6 +25,8 @@ concurrency:
 jobs:
   release:
     name: Build and release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     runs-on: xcode-27 # Xcode 27 image (macOS 27, arm64); the app targets macOS 15+
     timeout-minutes: 30
     permissions:
@@ -37,6 +37,7 @@ jobs:
           persist-credentials: false
 
       - name: Version
+        id: version
         run: |
           base="$(sed -n 's/.*"MARKETING_VERSION": "\(.*\)".*/\1/p' ReadFast.xcodeproj/project.xcproj | head -1)"
           tags="$(git ls-remote --tags origin "refs/tags/v$base.*")"
@@ -47,6 +48,7 @@ jobs:
             version="$base.$(( ${last:--1} + 1 ))"
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build
         run: |
@@ -140,3 +142,12 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "readfast $VERSION"
           git push
+
+  linux:
+    name: Linux
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/linux.yml
+    with:
+      version: ${{ needs.release.outputs.version }}
