@@ -186,14 +186,13 @@ struct SearchTests {
         let (f, url) = try Self.file(text)
         defer { try? FileManager.default.removeItem(at: url) }
         let scanned = Atomic(0)
-        let started = Atomic(false)
+        // Cancel from inside, on the first step: waiting for it from another task raced the
+        // scan on busy CI runners (the waiter wasn't scheduled until the scan was half done).
         let task = Task {
             for await _ in f.search("b", caseSensitive: false, threads: 1, segmentBytes: 64 << 10, onSegment: { scanned.store($0, ordering: .relaxed) }) {
-                started.store(true, ordering: .relaxed)
+                withUnsafeCurrentTask { $0?.cancel() }
             }
         }
-        while !started.load(ordering: .relaxed) { try await Task.sleep(for: .milliseconds(1)) }
-        task.cancel()
         await task.value
         try await Task.sleep(for: .milliseconds(200))
         let stoppedAt = scanned.load(ordering: .relaxed)
