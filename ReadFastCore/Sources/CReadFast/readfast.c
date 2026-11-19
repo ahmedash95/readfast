@@ -1,5 +1,4 @@
 #include "scan.h"
-#include <dispatch/dispatch.h>
 #include <string.h>
 
 uint64_t rf_eq_mask(const uint8_t *b, uint8_t c) {
@@ -173,7 +172,7 @@ uint8_t rf_index_units(const uint8_t *p, size_t n, size_t bs, size_t threads, ui
     index_ctx c = {.p = p, .n = n, .bs = bs, .blocks = blocks, .threads = threads, .s = {delim, nl},
                    .unit = unit, .counts = counts, .state_at = state_at};
     c.starts[0] = start_state;
-    dispatch_apply_f(threads, DISPATCH_APPLY_AUTO, &c, scan_worker);
+    rf_parallel(threads, &c, scan_worker);
     uint8_t state = c.ends[0];
     for (size_t k = 1; k < threads; k++) {
         size_t b = chunk_first_block(&c, k), end = chunk_first_block(&c, k + 1);

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ReadFast
+Comment=Open huge CSV files instantly
+Exec=readfast %F
+Icon=dev.ahmedash.readfast
+Terminal=false
+Categories=Office;Viewer;
+MimeType=text/csv;text/tab-separated-values;

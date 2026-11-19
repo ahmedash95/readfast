@@ -1,6 +1,5 @@
 #include "rf_search.h"
 #include "scan.h"
-#include <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -165,7 +164,7 @@ size_t rf_search(const uint8_t *p, size_t n, size_t from, size_t to, const uint8
         free(counts);
         free(states);
     }
-    dispatch_apply_f(c.threads, DISPATCH_APPLY_AUTO, &c, scan);
+    rf_parallel(c.threads, &c, scan);
 
     size_t total = 0;
     for (size_t k = 0; k < c.threads; k++) total += c.chunks[k].count;
